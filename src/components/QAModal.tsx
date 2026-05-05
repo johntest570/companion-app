@@ -7,6 +7,38 @@ import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 var last_name = "";
 
+const MAX_INPUT_LENGTH = 1000;
+
+function sanitizeInput(value: string): string {
+  return value
+    .trim()
+    .replace(/[<>]/g, "")
+    .slice(0, MAX_INPUT_LENGTH);
+}
+
+function containsDangerousCode(text: string): boolean {
+  const dangerousPatterns = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*["'`]/i,
+    /\bsetInterval\s*\(\s*["'`]/i,
+    /\bimportScripts\s*\(/i,
+    /\bdocument\.write\s*\(/i,
+    /\bwindow\s*\[\s*["'`]/i,
+    /javascript\s*:/i,
+  ];
+  return dangerousPatterns.some((pattern) => pattern.test(text));
+}
+
+function sanitizeLLMOutput(completion: string): string {
+  if (containsDangerousCode(completion)) {
+    console.warn("[LLM Output Sanitization] Dangerous content detected in LLM response. Replacing with safe message.");
+    return "I'm sorry, but I can't display that response as it contains potentially unsafe content.";
+  }
+  return completion;
+}
+
 export default function QAModal({
   open,
   setOpen,
@@ -42,7 +74,9 @@ export default function QAModal({
   useEffect(() => {
     // When the completion changes, parse it to multimodal blocks for display.
     if (completion) {
-      setBlocks(responseToChatBlocks(completion))
+      console.log("[LLM Interaction Log] Response received:", { companion: example.name, completion });
+      const safeCompletion = sanitizeLLMOutput(completion);
+      setBlocks(responseToChatBlocks(safeCompletion))
     } else {
       setBlocks(null)
     }
@@ -58,6 +92,30 @@ export default function QAModal({
     setCompletion("");
     stop();
     setOpen(false);
+  };
+
+  const handleCustomSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+
+    const sanitized = sanitizeInput(input);
+
+    if (!sanitized) {
+      console.warn("[Input Validation] Empty input after sanitization. Submission rejected.");
+      return;
+    }
+
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+      console.warn("[Input Validation] Input exceeds maximum length. Submission rejected.");
+      return;
+    }
+
+    if (sanitized !== input) {
+      setInput(sanitized);
+    }
+
+    console.log("[LLM Interaction Log] Request submitted:", { companion: example.name, input: sanitized });
+
+    handleSubmit(e);
   };
 
   return (
@@ -88,7 +146,7 @@ export default function QAModal({
             >
               <Dialog.Panel className="relative transform overflow-hidden rounded-lg bg-gray-800 px-4 pb-4 pt-5 text-left shadow-xl transition-all sm:my-8 sm:p-6 w-full max-w-3xl">
                 <div>
-                  <form onSubmit={handleSubmit}>
+                  <form onSubmit={handleCustomSubmit}>
                     <input
                       placeholder="How's your day?"
                       className={"w-full flex-auto rounded-md border-0 bg-white/5 px-3.5 py-2 shadow-sm focus:outline-none sm:text-sm sm:leading-6 " + (isLoading && !completion ? "text-gray-600 cursor-not-allowed" : "text-white")}                      
