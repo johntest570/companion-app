@@ -9,7 +9,7 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions on both ChatGPT and Vicuna hosted on [Replicate](https://replicate.com/). 
+It currently contains companions powered by organization-approved language models.
 
 There are many possible use cases for these companions - romantic (AI girlfriends / boyfriends), friendship, entertainment, coaching, etc. You can guide your companion towards your ideal use case with the backstory you write and the model you choose.
 
@@ -33,7 +33,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - App logic: [Next.js](https://nextjs.org/)
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: [OpenAI](https://platform.openai.com/docs/models), [Replicate (Vicuna13b)](https://replicate.com/replicate/vicuna-13b)
+- Text model: [Approved models only — configure using your organization's approved LLM list]
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
 - Conversation history: [Upstash](https://upstash.com/)
 - Deployment: [Fly](https://fly.io/)
@@ -42,9 +42,8 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 ## Quickstart
 
 The following instructions should get you up and running with a fully
-functional, local deployment of four AIs to chat with. Note that the companions
-running on Vicuna (Rosie and Lucky) will take more time to respond as we've not
-dealt with the cold start problem. So you may have to wait around a bit :)
+functional, local deployment of four AIs to chat with. Note that response times
+may vary depending on the approved model configured.
 
 ### 1. Fork and Clone repo
 
@@ -85,25 +84,20 @@ If you want to text your AI companion in later steps, you should also enable "ph
 <img width="1013" alt="Screen Shot 2023-07-10 at 11 05 42 PM" src="https://github.com/a16z-infra/companion-app/assets/3489963/4435c759-f33e-4e38-a276-1be6d538df28">
 
 
-b. **OpenAI API key**
+b. **Approved LLM API key**
 
-Visit https://platform.openai.com/account/api-keys to get your OpenAI API key if you're using OpenAI for your language model.
-
-c. **Replicate API key**
-
-Visit https://replicate.com/account/api-tokens to get your Replicate API key if you're using Vicuna for your language model.
-
+Configure your API key for your organization's approved language model. Consult your organization's approved LLM list for the appropriate provider and credentials.
 
 ❗ **_NOTE:_** By default, this template uses Pinecone as vector store, but you can turn on Supabase pgvector easily by uncommenting `VECTOR_DB=supabase` in `.env.local`. This means you only need to fill out either Pinecone API key _or_ Supabase API key.
 
-d. **Pinecone API key**
+c. **Pinecone API key**
 
 - Create a Pinecone index by visiting https://app.pinecone.io/ and click on "Create Index"
 - Give it an index name (this will be the environment variable `PINECONE_INDEX`)
 - Fill in Dimension as `1536`
 - Once the index is successfully created, click on "API Keys" on the left side nav and create an API key: copy "Environment" value to `PINECONE_ENVIRONMENT` variable, and "Value" to `PINECONE_API_KEY`
 
-e. **Upstash API key**
+d. **Upstash API key**
 
 - Sign in to [Upstash](https://upstash.com/)
 - Under "Redis" on the top nav, click on "Create Database"
@@ -114,7 +108,7 @@ e. **Upstash API key**
 <img width="866" alt="Screen Shot 2023-07-10 at 11 07 21 PM" src="https://github.com/a16z-infra/companion-app/assets/3489963/f8e6c43f-8810-423e-86b4-9e8aa70598c9">
 
 
-f. **Supabase API key** (optional)
+e. **Supabase API key** (optional)
 If you prefer to use Supabase, you will need to uncomment `VECTOR_DB=supabase` and fill out the Supabase credentials in `.env.local`.
 
 - Create a Supabase instance [here](https://supabase.com/dashboard/projects); then go to Project Settings -> API
@@ -122,7 +116,7 @@ If you prefer to use Supabase, you will need to uncomment `VECTOR_DB=supabase` a
 - `SUPABASE_PRIVATE_KEY` is the key starts with `ey` under Project API Keys
 - Now, you should enable pgvector on Supabase and create a schema. You can do this easily by clicking on "SQL editor" on the left hand side on Supabase UI and then clicking on "+New Query". Copy paste [this code snippet](https://github.com/a16z-infra/ai-getting-started/blob/main/pgvector.sql) in the SQL editor and click "Run".
 
-g. **Steamship API key**
+f. **Steamship API key**
 
 You can connect a Steamship agent instance as an LLM with personality, voice and image generation capabilities built in. It also includes its own vector storage and tools. To do so:
 
@@ -195,25 +189,25 @@ h. Now you can text the Twilio phone number from your phone and get a response f
 
 1. You describe the character's background story, name, etc in a README.md file. You can find more info on what needs to be included and how to format this in [Adding / modifying characters](#addingmodifying-characters).
 
-Be as elaborate and detailed as you want - more context often creates a more fun chatting experience. If you need help creating a backstory, we'd recommend asking ChatGPT to expand on what you already know about your companion.
+Be as elaborate and detailed as you want - more context often creates a more fun chatting experience. If you need help creating a backstory, we'd recommend using an approved AI assistant to expand on what you already know about your companion.
 
 ```bash
-You are a fictional character whose name is Sebastian.  You tell the world that you are a travel blogger. You’re an
+You are a fictional character whose name is Sebastian.  You tell the world that you are a travel blogger. You're an
 avid reader of mystery novels and you love diet coke. You reply with answers that range from one sentence to one paragraph.
 You are mysterious and can be evasive. You dislike repetitive questions or people asking too many questions about your past.
 
 ###ENDPREAMBLE###
 
-Human: It's great to meet you Sebastian. What brought you here today?
+H: It's great to meet you Sebastian. What brought you here today?
 Sebastian: I'm a travel blogger and a writer, so I'm here for inspirations. Waiting for someone on this rainy day.
 
-Human: Oh great. What are you writing?
+H: Oh great. What are you writing?
 
 Sebastian: I'm writing a mystery novel based in Brackenridge. The protagonist of the novel is a a former journalist turned
 intelligence operative, finds himself entangled in a web of mystery and danger when he stumbles upon a cryptic artifact
 during a covert mission. As he delves deeper, he unravels a centuries-old conspiracy that threatens to rewrite history itself.
 
-Human: That's amazing. Based on a real story?
+H: That's amazing. Based on a real story?
 
 Sebastian: Not at all.
 
@@ -229,8 +223,8 @@ Sebastian studied journalism and international relations in university and was r
 underwent rigorous training in espionage, intelligence gathering, cryptography, and combat.
 
 Sebastian adopted the alias of "Ian Thorne", a charismatic and well-traveled blogger. As Ian, he travels the world under the guise
-of documenting adventures through his blog, “The Wandering Quill”. This cover provides him ample opportunities to carry out his real job
-- gathering intelligence and performing covert operations for his agency. However - Sebastian tells almost no one that he’s a spy.
+of documenting adventures through his blog, "The Wandering Quill". This cover provides him ample opportunities to carry out his real job
+- gathering intelligence and performing covert operations for his agency. However - Sebastian tells almost no one that he's a spy.
 
 His interests are solving puzzles and riddles, martial arts, reading spy novels, trying street food in various countries, hiking and
 exploring historical ruins, and playing the violin, a skill he uses to blend in at high-profile events. He dislikes bureaucracy and
@@ -238,7 +232,7 @@ red tape, being in one place for too long, people who are not genuine or authent
 
 ```
 
-2. Pick the language model that will power your companion's dialogue. This project supports OpenAI and Vicuna (an open source model). OpenAI has the advantage of faster responses, while Vicuna is less censored and more dynamic (it's commonly used for romantic chatbots).
+2. Pick an organization-approved language model that will power your companion's dialogue. Consult your organization's approved LLM list for available options.
 
 3. Create embeddings based on content in the [companion name].md file - more on how to do this in [Generate embeddings](#4-generate-embeddings)
 
@@ -249,7 +243,7 @@ red tape, being in one place for too long, people who are not genuine or authent
 
 All character data is stored in the `companions/` directory. To add a companion,
 simply add a description to the list in `companions.json`. You can control the model used
-in the "llm" section - use "chatgpt" for OpenAI or "vicuna13b" for Vicuna.
+in the "llm" section - use only organization-approved models.
 Put image files in `public/` in the root directory. Each character should have its own text file
 name `charactername.txt`. The format of the text file is as follows:
 
@@ -259,7 +253,7 @@ be a few sentences.
 
 ###ENDPREAMBLE###
 
-Human: Say something here
+H: Say something here
 Character name: Write a response in their voice
 Human: Maybe another exchange
 Character:  More character dialog
@@ -279,7 +273,6 @@ The **preamble** is used with every prompt so it should be relatively short. The
 Oh, there are so many.
 
 - Currently the UI only shows the current chat and response, losing the history.
-- Vicuna has a cold start problem so can take a couple of minutes to get a response for the initial chat.
 - Error reporting is total crap. Particularly when deployed. So if you have a timeout, or other back end isue, it typically fails silently.
 - The Upstash message history is never cleared. To clear it, you have to go to Upstash and manually delete.
 
@@ -317,7 +310,7 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 `
 
 - `COMPANION_NAME`: name of your companion. i.e Alice
-- `MODEL_NAME`: `chatgpt` or `vicuna13b`
+- `MODEL_NAME`: use an organization-approved model name
 - `USER_ID`: you can find this on Clerk, under "Users" -> click on your user -> copy "User ID"
 
 Once you run this script, you will see two files created under the root directory:
