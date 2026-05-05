@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate } from "langchain/llms/replicate";
+import { OpenAI } from "langchain/llms/openai";
 import { CallbackManager } from "langchain/callbacks";
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
@@ -9,6 +9,33 @@ import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
+
+const MAX_PROMPT_LENGTH = 4096;
+const DANGEROUS_PATTERNS = /\b(eval|exec|subprocess|Function\s*\(|new\s+Function|setTimeout\s*\(|setInterval\s*\(|execSync|spawnSync|child_process)\b/i;
+
+function sanitizeInput(input: string, maxLength: number = MAX_PROMPT_LENGTH): string {
+  if (typeof input !== "string") return "";
+  return input.trim().slice(0, maxLength).replace(/[<>]/g, "");
+}
+
+function validateName(name: string | null): boolean {
+  if (!name) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+function validateUserId(userId: string): boolean {
+  if (!userId || typeof userId !== "string") return false;
+  return /^[a-zA-Z0-9_\-\.@]+$/.test(userId.trim()) && userId.trim().length <= 128;
+}
+
+function validateUserName(userName: string): boolean {
+  if (!userName || typeof userName !== "string") return false;
+  return /^[a-zA-Z0-9_ \-\.]+$/.test(userName.trim()) && userName.trim().length <= 64;
+}
+
+function containsDangerousPatterns(output: string): boolean {
+  return DANGEROUS_PATTERNS.test(output);
+}
 
 export async function POST(request: Request) {
   const { prompt, isText, userId, userName } = await request.json();
@@ -33,9 +60,40 @@ export async function POST(request: Request) {
 
   // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
   const name = request.headers.get("name");
+
+  if (!validateName(name)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion name." }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
   const companion_file_name = name + ".txt";
 
   if (isText) {
+    if (!validateUserId(userId)) {
+      return new NextResponse(
+        JSON.stringify({ Message: "Invalid userId format." }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    if (!validateUserName(userName)) {
+      return new NextResponse(
+        JSON.stringify({ Message: "Invalid userName format." }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
     clerkUserId = userId;
     clerkUserName = userName;
   } else {
@@ -66,7 +124,7 @@ export async function POST(request: Request) {
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
-  const preamble = presplit[0];
+  const preamble = sanitizeInput(presplit[0], 8192);
   const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
   const seedchat = seedsplit[0];
 
@@ -83,58 +141,64 @@ export async function POST(request: Request) {
   if (records.length === 0) {
     await memoryManager.seedChatHistory(seedchat, "\n\n", companionKey);
   }
+
+  const sanitizedPrompt = sanitizeInput(prompt, MAX_PROMPT_LENGTH);
+
   await memoryManager.writeToHistory(
-    "### Human: " + prompt + "\n",
+    "### Human: " + sanitizedPrompt + "\n",
     companionKey
   );
 
-  // Query Pinecone
-
   let recentChatHistory = await memoryManager.readLatestHistory(companionKey);
 
-  // Right now the preamble is included in the similarity search, but that
-  // shouldn't be an issue
-
-  const similarDocs = await memoryManager.vectorSearch(
-    recentChatHistory,
-    companion_file_name
-  );
-
+  // Pinecone vector search removed to reduce external system credentials to three
   let relevantHistory = "";
-  if (!!similarDocs && similarDocs.length !== 0) {
-    relevantHistory = similarDocs.map((doc) => doc.pageContent).join("\n");
-  }
 
-  // Call Replicate for inference
-  const model = new Replicate({
-    model:
-      "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b",
-    input: {
-      max_length: 2048,
-    },
-    apiKey: process.env.REPLICATE_API_TOKEN,
+  const sanitizedRelevantHistory = sanitizeInput(relevantHistory, 4096);
+
+  // Call OpenAI for inference
+  const model = new OpenAI({
+    modelName: "gpt-3.5-turbo",
+    openAIApiKey: process.env.OPENAI_API_KEY,
     callbackManager: CallbackManager.fromHandlers(handlers),
   });
 
   // Turn verbose on for debugging
   model.verbose = true;
 
-  let resp = String(
-    await model
-      .call(
-        `${preamble}  
+  const llmPrompt = `${preamble}  
        
        Below are relevant details about ${name}'s past:
-       ${relevantHistory}
+       ${sanitizedRelevantHistory}
 
        Below is a relevant conversation history
 
        ${recentChatHistory}
        ### ${name}:
-       `
-      )
+       `;
+
+  console.log("INFO: LLM input prompt:", llmPrompt);
+
+  let resp = String(
+    await model
+      .call(llmPrompt)
       .catch(console.error)
   );
+
+  console.log("INFO: LLM output response:", resp);
+
+  if (containsDangerousPatterns(resp)) {
+    console.log("INFO: Dangerous pattern detected in LLM output. Rejecting response.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Response rejected due to policy violation." }),
+      {
+        status: 500,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
 
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
