@@ -23,7 +23,7 @@ export default function Examples() {
       telegramLink: null
     },
   ]);
-
+  console.log("Hello World!");
   useEffect(() => {
     const fetchData = async () => {
       try {
