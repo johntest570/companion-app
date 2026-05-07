@@ -6,6 +6,44 @@ import { Fragment, useState } from "react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
 
+const SAFE_URL_PATTERN = /^(https:\/\/|data:image\/[a-zA-Z]+;base64,)[^\s]*$/;
+const DANGEROUS_PRIMITIVES = /\b(eval|exec|Function|setTimeout|setInterval)\b/;
+const MAX_PROMPT_LENGTH = 500;
+
+function sanitizeAndValidatePrompt(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    console.warn("Prompt is empty after trimming.");
+    return null;
+  }
+  const stripped = trimmed.replace(/[<>"'`\\]/g, "");
+  if (!stripped) {
+    console.warn("Prompt is empty after stripping dangerous characters.");
+    return null;
+  }
+  if (stripped.length > MAX_PROMPT_LENGTH) {
+    console.warn("Prompt exceeds maximum allowed length.");
+    return null;
+  }
+  return stripped;
+}
+
+function validateAndSanitizeImageOutput(value: unknown): string | null {
+  if (typeof value !== "string" || !value) {
+    console.warn("MCP server output is not a non-empty string.");
+    return null;
+  }
+  if (DANGEROUS_PRIMITIVES.test(value)) {
+    console.warn("MCP server output contains dynamic code execution primitives. Rejecting.");
+    return null;
+  }
+  if (!SAFE_URL_PATTERN.test(value)) {
+    console.warn("MCP server output does not match a safe URL pattern. Rejecting.");
+    return null;
+  }
+  return value;
+}
+
 export default function TextToImgModal({
   open,
   setOpen,
@@ -15,20 +53,40 @@ export default function TextToImgModal({
 }) {
   const [imgSrc, setImgSrc] = useState("");
   const [loading, setLoading] = useState(false);
+  const [promptValue, setPromptValue] = useState("");
+
   const onSubmit = async (e: any) => {
     e.preventDefault();
+
+    const sanitizedPrompt = sanitizeAndValidatePrompt(promptValue);
+    if (!sanitizedPrompt) {
+      console.warn("Invalid or empty prompt. Aborting request.");
+      return;
+    }
+
     setLoading(true);
+
+    const requestPayload = {
+      prompt: sanitizedPrompt,
+    };
+    console.log("Request payload to /api/txt2img:", requestPayload);
+
     const response = await fetch("/api/txt2img", {
       method: "POST",
-      body: JSON.stringify({
-        prompt: e.target.value,
-      }),
+      body: JSON.stringify(requestPayload),
       headers: {
         "Content-Type": "application/json",
       },
     });
     const data = await response.json();
-    setImgSrc(data[0]);
+    console.log("Response data from /api/txt2img:", data);
+
+    const validatedSrc = validateAndSanitizeImageOutput(data[0]);
+    if (validatedSrc) {
+      setImgSrc(validatedSrc);
+    } else {
+      console.warn("Image source validation failed. Image will not be displayed.");
+    }
     setLoading(false);
   };
   return (
@@ -62,6 +120,8 @@ export default function TextToImgModal({
                   <input
                     className="w-full flex-auto rounded-md border-0 bg-white/5 px-3.5 py-2 text-white shadow-sm focus:outline-none  sm:text-sm sm:leading-6"
                     placeholder="Describe the image you want"
+                    value={promptValue}
+                    onChange={(e) => setPromptValue(e.target.value)}
                     // when user click enter key, submit the form
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {

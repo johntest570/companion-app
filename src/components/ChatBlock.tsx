@@ -3,6 +3,57 @@
  *
  * For streaming responses, just update the `text` argument.
  */
+
+/*
+ * Sanitizes a string value extracted from LLM output by detecting and stripping
+ * dangerous dynamic code execution primitives such as eval, exec, Function constructor, etc.
+ */
+function sanitizeLLMString(value: string): string {
+    // Patterns for dangerous dynamic code execution primitives
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bFunction\s*\(/gi,
+        /\bsetTimeout\s*\(\s*["'`]/gi,
+        /\bsetInterval\s*\(\s*["'`]/gi,
+        /\bsetImmediate\s*\(\s*["'`]/gi,
+        /\bexecScript\s*\(/gi,
+        /\bimportScripts\s*\(/gi,
+        /javascript\s*:/gi,
+        /\bdocument\.write\s*\(/gi,
+        /\bwindow\.location\s*=/gi,
+        /\blocation\.href\s*=/gi,
+    ];
+
+    let sanitized = value;
+    for (const pattern of dangerousPatterns) {
+        sanitized = sanitized.replace(pattern, '[REMOVED]');
+    }
+    return sanitized;
+}
+
+/*
+ * Sanitizes all string fields in a block object extracted from LLM output.
+ */
+function sanitizeBlock(block: any): any {
+    if (typeof block === 'string') {
+        return sanitizeLLMString(block);
+    }
+    if (typeof block === 'object' && block !== null) {
+        const sanitized: any = {};
+        for (const key of Object.keys(block)) {
+            if (typeof block[key] === 'string') {
+                sanitized[key] = sanitizeLLMString(block[key]);
+            } else {
+                sanitized[key] = block[key];
+            }
+        }
+        return sanitized;
+    }
+    return block;
+}
+
 export function ChatBlock({text, mimeType, url} : {
     text?: string,
     mimeType?: string,
@@ -53,17 +104,19 @@ export function responseToChatBlocks(completion: any) {
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
+        const sanitized = sanitizeLLMString(completion);
+        blocks.push(<ChatBlock text={sanitized} />)
     } else if (Array.isArray(completion)) {
         console.log("Is array")
         for (let block of completion) {
             console.log(block)
-            blocks.push(<ChatBlock {...block} />)
+            const sanitizedBlock = sanitizeBlock(block);
+            blocks.push(<ChatBlock {...sanitizedBlock} />)
         }
     } else {
-        blocks.push(<ChatBlock {...completion} />)
+        const sanitizedBlock = sanitizeBlock(completion);
+        blocks.push(<ChatBlock {...sanitizedBlock} />)
     }
     console.log(blocks)
     return blocks
 }
-
