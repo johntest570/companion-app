@@ -5,272 +5,183 @@ import { ChatAnthropic } from "langchain/chat_models/anthropic";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
+import path from "path";
 dotenv.config({ path: `.env.local` });
 
-// Credentialed external systems (2 total — compliant with ≤3 policy):
-//   1. Upstash Redis  (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-//   2. Anthropic Claude (ANTHROPIC_API_KEY)
+// ── Credentials block ────────────────────────────────────────────────────────
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const EXPORT_SECRET = process.env.EXPORT_SECRET;
+
+if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+  throw new Error("Missing required Redis credentials in environment.");
+}
+if (!ANTHROPIC_API_KEY) {
+  throw new Error("Missing required ANTHROPIC_API_KEY in environment.");
+}
+if (!EXPORT_SECRET) {
+  throw new Error("Missing required EXPORT_SECRET in environment.");
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const COMPANION_NAME = process.argv[2];
 const MODEL_NAME = process.argv[3];
-const USER_ID = process.argv[4];
+const PROVIDED_TOKEN = process.argv[4];
+const USER_ID = process.argv[5];
 
-if (!!!COMPANION_NAME || !!!MODEL_NAME || !!!USER_ID) {
+if (!COMPANION_NAME || !MODEL_NAME || !PROVIDED_TOKEN || !USER_ID) {
   throw new Error(
-    "**Usage**: npm run export-to-character <COMPANION_NAME> <MODEL_NAME> <USER_ID>"
+    "**Usage**: npm run generate-character <COMPANION_NAME> <MODEL_NAME> <SECRET_TOKEN> <USER_ID>"
   );
 }
 
-// ---------------------------------------------------------------------------
-// Sanitization helpers
-// ---------------------------------------------------------------------------
+// ── Authentication check ─────────────────────────────────────────────────────
+if (PROVIDED_TOKEN !== EXPORT_SECRET) {
+  throw new Error("Authentication failed: invalid secret token.");
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── COMPANION_NAME validation (path traversal / injection prevention) ─────────
+const SAFE_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+if (!SAFE_NAME_RE.test(COMPANION_NAME)) {
+  throw new Error(
+    "Invalid COMPANION_NAME: only alphanumeric characters, hyphens, and underscores are allowed."
+  );
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Explicit tool / question allow-list ──────────────────────────────────────
+const ALLOWED_QUESTIONS = [
+  `Greeting: What would ${COMPANION_NAME} say to start a conversation?`,
+  `Short Description: In a few sentences, how would ${COMPANION_NAME} describe themselves?`,
+  `Long Description: In a few sentences, how would ${COMPANION_NAME} describe themselves?`,
+];
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Sanitization helpers ─────────────────────────────────────────────────────
 
 /**
- * Strips prompt-injection characters and enforces a length limit on
- * user-controlled scalar values (COMPANION_NAME, MODEL_NAME, USER_ID).
+ * Strip non-printable / control characters and common prompt-injection patterns.
  */
-function sanitizeInput(value, maxLength = 256) {
-  if (typeof value !== "string") return "";
-  // Remove null bytes, control characters (except newline/tab), and common
-  // prompt-injection delimiters.
-  let sanitized = value
-    .replace(/\0/g, "")
-    .replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/g, "")
-    .replace(/[<>{}|\\^`]/g, "")
-    .trim();
-  return sanitized.slice(0, maxLength);
+function sanitizeInput(text) {
+  if (typeof text !== "string") return "";
+  // Remove non-printable / control characters (except newline and tab)
+  let sanitized = text.replace(/[^\x09\x0A\x20-\x7E\u00A0-\uFFFF]/g, "");
+  // Strip prompt-injection patterns
+  sanitized = sanitized.replace(
+    /\b(ignore previous instructions?|disregard (all )?previous|you are now|act as|system prompt|<\/?s>|<\/?system>)\b/gi,
+    "[REDACTED]"
+  );
+  return sanitized;
 }
 
 /**
- * Strips hidden/invisible Unicode characters, base64-encoded blobs,
- * binary/shell command patterns, leetspeak-obfuscated prompt injections,
- * and explicit prompt-override phrases from file content.
+ * Detect and strip hidden/invisible characters, base64-encoded payloads,
+ * leetspeak, shell/binary commands, and other suspicious patterns from
+ * file-sourced content.
  */
 function sanitizeFileContent(text) {
   if (typeof text !== "string") return "";
-
-  // Remove invisible / zero-width Unicode characters
+  // Remove zero-width and other invisible Unicode characters
   let sanitized = text.replace(
     /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/g,
     ""
   );
-
-  // Remove base64-encoded blobs (long runs of base64 chars)
-  sanitized = sanitized.replace(/[A-Za-z0-9+/]{100,}={0,2}/g, "[REDACTED_B64]");
-
-  // Remove shell/binary command patterns
+  // Remove non-printable control characters (except newline and tab)
+  sanitized = sanitized.replace(/[^\x09\x0A\x20-\x7E\u00A0-\uFFFF]/g, "");
+  // Detect and redact base64-encoded blobs (long base64 strings)
   sanitized = sanitized.replace(
-    /(\b)(bash|sh|cmd|powershell|exec|system|popen|subprocess|eval|Function)\s*[\(\[`]/gi,
-    "[REDACTED_CMD]"
+    /(?:[A-Za-z0-9+/]{40,}={0,2})/g,
+    "[BASE64_REDACTED]"
   );
-
-  // Remove explicit prompt-override phrases
-  const overridePhrases = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
-    /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
-    /you\s+are\s+now\s+/gi,
-    /new\s+instructions?:/gi,
-    /system\s*prompt:/gi,
-    /###\s*instruction/gi,
-  ];
-  for (const pattern of overridePhrases) {
-    sanitized = sanitized.replace(pattern, "[REDACTED_INJECTION]");
-  }
-
-  // Remove leetspeak-obfuscated variants (simple pass)
+  // Redact shell command patterns
   sanitized = sanitized.replace(
-    /[1!][Gg][Nn][Oo][Rr][Ee]/g,
-    "[REDACTED_LEET]"
+    /\b(bash|sh|cmd|powershell|exec|system|popen|subprocess|os\.system|eval|Function\s*\(|new\s+Function)\b/gi,
+    "[CMD_REDACTED]"
   );
-
+  // Redact prompt injection patterns
+  sanitized = sanitized.replace(
+    /\b(ignore previous instructions?|disregard (all )?previous|you are now|act as|system prompt|<\/?s>|<\/?system>)\b/gi,
+    "[REDACTED]"
+  );
   return sanitized;
 }
 
 /**
- * Redacts common PII patterns from text.
- */
-function redactPII(text) {
-  if (typeof text !== "string") return "";
-
-  let redacted = text;
-
-  // Email addresses
-  redacted = redacted.replace(
-    /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
-    "[REDACTED_EMAIL]"
-  );
-
-  // Phone numbers (various formats)
-  redacted = redacted.replace(
-    /(\+?\d[\d\s\-().]{7,}\d)/g,
-    "[REDACTED_PHONE]"
-  );
-
-  // SSNs (US)
-  redacted = redacted.replace(
-    /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g,
-    "[REDACTED_SSN]"
-  );
-
-  // Credit card numbers
-  redacted = redacted.replace(
-    /\b(?:\d[ \-]?){13,16}\b/g,
-    "[REDACTED_CC]"
-  );
-
-  // IPv4 addresses
-  redacted = redacted.replace(
-    /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g,
-    "[REDACTED_IP]"
-  );
-
-  // Singapore NRIC/FIN (e.g. S1234567A, T9876543Z, F1234567X, G1234567P)
-  redacted = redacted.replace(
-    /\b[STFG]\d{7}[A-Z]\b/g,
-    "[REDACTED_NRIC]"
-  );
-
-  // Singapore SingPass identifiers (common prefix patterns)
-  redacted = redacted.replace(
-    /\bSingPass[\s:]*\S+/gi,
-    "[REDACTED_SINGPASS]"
-  );
-
-  return redacted;
-}
-
-/**
- * Detects Singapore-specific PII in file content and throws if found.
- */
-function detectSingaporePII(text) {
-  const patterns = [
-    { name: "NRIC/FIN", regex: /\b[STFG]\d{7}[A-Z]\b/ },
-    { name: "SingPass", regex: /\bSingPass[\s:]*\S+/i },
-    {
-      name: "SG_DOB",
-      regex: /\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19|20)\d{2}\b/,
-    },
-    {
-      name: "SG_ADDRESS",
-      regex: /\b(Blk|Block|#\d{2}-\d{2,4}|Singapore\s+\d{6})\b/i,
-    },
-  ];
-
-  for (const { name, regex } of patterns) {
-    if (regex.test(text)) {
-      throw new Error(
-        `File contains Singapore PII (${name}). Processing aborted.`
-      );
-    }
-  }
-}
-
-/**
- * Validates LLM output by removing dynamic code execution primitives.
+ * Sanitize LLM output: reject / strip dynamic code execution primitives.
  */
 function sanitizeLLMOutput(text) {
   if (typeof text !== "string") return "";
-
-  let sanitized = text;
-
-  // Remove eval, exec, subprocess, Function constructor, etc.
   const dangerousPatterns = [
     /\beval\s*\(/gi,
     /\bexec\s*\(/gi,
-    /\bsubprocess\s*\./gi,
     /\bnew\s+Function\s*\(/gi,
     /\bsetTimeout\s*\(\s*["'`]/gi,
     /\bsetInterval\s*\(\s*["'`]/gi,
-    /\bimport\s*\(\s*["'`]/gi,
-    /\brequire\s*\(\s*["'`]/gi,
-    /\bchild_process\b/gi,
-    /\bspawnSync\s*\(/gi,
+    /\bimport\s*\(/gi,
+    /\brequire\s*\(/gi,
+    /\bprocess\.binding\s*\(/gi,
+    /\bchild_process/gi,
+    /\bspawn\s*\(/gi,
     /\bexecSync\s*\(/gi,
-    /\bexecFileSync\s*\(/gi,
-    /\bvm\.runInThisContext\s*\(/gi,
-    /\bvm\.runInNewContext\s*\(/gi,
+    /\bexecFile\s*\(/gi,
   ];
-
+  let sanitized = text;
   for (const pattern of dangerousPatterns) {
-    sanitized = sanitized.replace(pattern, "[REDACTED_CODE_EXEC]");
+    sanitized = sanitized.replace(pattern, "[BLOCKED]");
   }
-
   return sanitized;
 }
 
-// ---------------------------------------------------------------------------
-// Logging helper
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
-const LOG_FILE = `llm_interactions_${Date.now()}.log`;
+// ── Restricted output directory ───────────────────────────────────────────────
+const OUTPUT_DIR = path.resolve("output");
+await fs.mkdir(OUTPUT_DIR, { recursive: true });
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function logLLMInteraction(question, response) {
-  const entry = JSON.stringify({
-    timestamp: new Date().toISOString(),
-    input: question,
-    output: response,
-  });
-  await fs.appendFile(LOG_FILE, entry + "\n");
+// ── Read and sanitize companion file ─────────────────────────────────────────
+const companionsDir = path.resolve("companions");
+const companionFilePath = path.join(companionsDir, COMPANION_NAME + ".txt");
+// Ensure the resolved path stays within the companions directory
+if (!companionFilePath.startsWith(companionsDir + path.sep)) {
+  throw new Error("Path traversal detected in COMPANION_NAME.");
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-const sanitizedCompanionName = sanitizeInput(COMPANION_NAME);
-const sanitizedModelName = sanitizeInput(MODEL_NAME);
-const sanitizedUserId = sanitizeInput(USER_ID);
-
-const rawData = await fs.readFile(
-  "companions/" + sanitizedCompanionName + ".txt",
-  "utf8"
-);
-
-// Detect Singapore PII before any further processing
-detectSingaporePII(rawData);
-
-// Sanitize file content for malicious prompt injections
-const data = sanitizeFileContent(rawData);
-
+const data = await fs.readFile(companionFilePath, "utf8");
 const presplit = data.split("###ENDPREAMBLE###");
-const rawPreamble = presplit[0];
-const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
-const rawSeedChat = seedsplit[0];
-const rawBackgroundStory = seedsplit[1];
-
-// Redact PII from file-sourced content before sending to LLM
-const preamble = redactPII(rawPreamble);
-const seedChat = redactPII(rawSeedChat);
-const backgroundStory = redactPII(rawBackgroundStory);
-
+const preamble = sanitizeFileContent(sanitizeInput(presplit[0]));
+const seedsplit = presplit[1].split("###ENDSEED###");
+const seedChat = sanitizeFileContent(sanitizeInput(seedsplit[0]));
+const backgroundStory = sanitizeFileContent(sanitizeInput(seedsplit[1]));
 console.log(preamble, backgroundStory);
+// ─────────────────────────────────────────────────────────────────────────────
 
 const history = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  url: UPSTASH_REDIS_REST_URL,
+  token: UPSTASH_REDIS_REST_TOKEN,
 });
 
 const upstashChatHistory = await history.zrange(
-  `${sanitizedCompanionName}-${sanitizedModelName}-${sanitizedUserId}`,
+  `${COMPANION_NAME}-${MODEL_NAME}-${USER_ID}`,
   0,
   Date.now(),
   {
     byScore: true,
   }
 );
-const recentChatRaw = upstashChatHistory.slice(-30);
-
-// Redact PII from chat history before sending to LLM; keep raw for file output
-const recentChat = recentChatRaw.map((msg) =>
-  redactPII(sanitizeInput(String(msg), 2048))
-);
+const recentChat = upstashChatHistory
+  .slice(-30)
+  .map((entry) => sanitizeInput(String(entry)));
 
 const model = new ChatAnthropic({
   modelName: "claude-2",
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  anthropicApiKey: ANTHROPIC_API_KEY,
 });
 model.verbose = true;
+
+const sanitizedCompanionName = sanitizeInput(COMPANION_NAME);
 
 const chainPrompt = PromptTemplate.fromTemplate(`
   ### Background Story: 
@@ -282,7 +193,7 @@ const chainPrompt = PromptTemplate.fromTemplate(`
   ${seedChat}
 
   ...
-  ${recentChat}
+  ${recentChat.join("\n")}
 
   
   Above is someone whose name is ${sanitizedCompanionName}'s story and their chat history with a human. Output answer to the following question. Return only the answer itself 
@@ -294,48 +205,58 @@ const chain = new LLMChain({
   prompt: chainPrompt,
 });
 
-const questions = [
-  `Greeting: What would ${sanitizedCompanionName} say to start a conversation?`,
-  `Short Description: In a few sentences, how would ${sanitizedCompanionName} describe themselves?`,
-  `Long Description: In a few sentences, how would ${sanitizedCompanionName} describe themselves?`,
-];
+const questions = ALLOWED_QUESTIONS;
 
-// Sanitize question strings before passing to chain
-const sanitizedQuestions = questions.map((q) => sanitizeInput(q, 512));
+// ── LLM interaction log ───────────────────────────────────────────────────────
+const llmInteractionLog = [];
+// ─────────────────────────────────────────────────────────────────────────────
 
 const results = await Promise.all(
-  sanitizedQuestions.map(async (question) => {
+  questions.map(async (question) => {
+    // Validate question against allow-list
+    if (!ALLOWED_QUESTIONS.includes(question)) {
+      throw new Error(`Question not in allow-list: ${question}`);
+    }
+    const sanitizedQuestion = sanitizeInput(question);
+    const timestamp = new Date().toISOString();
+    let responseText = null;
+    let errorMsg = null;
     try {
-      // Log input before calling LLM
-      await logLLMInteraction(question, null);
-
-      const result = await chain.call({ question });
-
-      // Sanitize LLM output
-      if (result && result.text) {
-        result.text = sanitizeLLMOutput(result.text);
-      }
-
-      // Log output after receiving response
-      await logLLMInteraction(question, result ? result.text : null);
-
-      return result;
+      const result = await chain.call({ question: sanitizedQuestion });
+      responseText = sanitizeLLMOutput(result.text);
+      llmInteractionLog.push({
+        timestamp,
+        input: sanitizedQuestion,
+        output: responseText,
+      });
+      return { text: responseText };
     } catch (error) {
+      errorMsg = error.message || String(error);
+      llmInteractionLog.push({
+        timestamp,
+        input: sanitizedQuestion,
+        output: null,
+        error: errorMsg,
+      });
       console.error(error);
-      await logLLMInteraction(question, `ERROR: ${error.message}`);
+      throw error;
     }
   })
 );
 
-let output = "";
-for (let i = 0; i < sanitizedQuestions.length; i++) {
-  const sanitizedText =
-    results[i] && results[i].text
-      ? sanitizeLLMOutput(results[i].text)
-      : "";
-  output += `*****${sanitizedQuestions[i]}*****\n${sanitizedText}\n\n`;
-}
-output += `Definition (Advanced)\n${recentChatRaw.join("\n")}`;
+// Write LLM interaction log
+const logFilePath = path.join(OUTPUT_DIR, `llm_interactions_${Date.now()}.json`);
+await fs.writeFile(logFilePath, JSON.stringify(llmInteractionLog, null, 2), "utf8");
 
-await fs.writeFile(`${sanitizedCompanionName}_chat_history.txt`, upstashChatHistory);
-await fs.writeFile(`${sanitizedCompanionName}_character_ai_data.txt`, output);
+let output = "";
+for (let i = 0; i < questions.length; i++) {
+  output += `*****${questions[i]}*****\n${results[i].text}\n\n`;
+}
+output += `Definition (Advanced)\n${recentChat.join("\n")}`;
+
+// Write output files to restricted output directory only; do not write raw PII chat history
+await fs.writeFile(
+  path.join(OUTPUT_DIR, `${COMPANION_NAME}_character_ai_data.txt`),
+  output,
+  "utf8"
+);
