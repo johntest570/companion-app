@@ -8,150 +8,123 @@ import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
 
-// External systems accessed by this script:
-// 1. Pinecone (PINECONE_API_KEY, PINECONE_ENVIRONMENT, PINECONE_INDEX)
-// 2. HuggingFace Inference API (HUGGINGFACEHUB_API_KEY)
-
 dotenv.config({ path: `.env.local` });
 
-const MAX_CONTENT_LENGTH = 100000;
+// Runtime check for required environment variables
+const requiredEnvVars = [
+  "PINECONE_API_KEY",
+  "PINECONE_ENVIRONMENT",
+  "PINECONE_INDEX",
+  "HUGGINGFACEHUB_API_KEY",
+];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    throw new Error(`Missing required environment variable: ${envVar}`);
+  }
+}
 
+const MAX_FILE_SIZE = 1 * 1024 * 1024; // 1 MB
+const MAX_CHUNK_LENGTH = 2000;
+
+// Sanitize and validate content
 function sanitizeContent(content) {
-  // Strip null bytes and non-printable characters (except common whitespace)
-  let sanitized = content.replace(/\0/g, "");
-  sanitized = sanitized.replace(/[^\x09\x0A\x0D\x20-\x7E\x80-\xFF]/g, "");
-  // Trim whitespace
-  sanitized = sanitized.trim();
-  // Enforce maximum length
-  if (sanitized.length > MAX_CONTENT_LENGTH) {
-    sanitized = sanitized.slice(0, MAX_CONTENT_LENGTH);
-  }
-  // Reject empty content
-  if (sanitized.length === 0) {
-    throw new Error("Content is empty after sanitization.");
-  }
+  // Strip null bytes and non-printable control characters (except newline, tab, carriage return)
+  let sanitized = content.replace(/\0/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   return sanitized;
 }
 
-function detectMaliciousContent(content) {
-  // Check for hidden/invisible characters
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
-    throw new Error("File contains hidden or invisible characters.");
-  }
-  // Check for base64-encoded prompts (long base64 strings)
-  if (/[A-Za-z0-9+/]{100,}={0,2}/.test(content)) {
-    throw new Error("File contains potential base64-encoded content.");
-  }
-  // Check for leetspeak patterns
-  if (/(\b\w*[0-9]\w*[0-9]\w*[0-9]\w*\b.*){3,}/i.test(content)) {
-    throw new Error("File contains potential leetspeak patterns.");
-  }
-  // Check for suspicious AI instruction patterns
-  const aiInstructionPatterns = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /you\s+are\s+now\s+(a\s+)?(\w+\s+)?AI/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
-    /system\s*:\s*you\s+are/i,
-    /\[INST\]/i,
-    /<<SYS>>/i,
-    /###\s*instruction/i,
-    /prompt\s*injection/i,
-    /jailbreak/i,
-  ];
-  for (const pattern of aiInstructionPatterns) {
-    if (pattern.test(content)) {
-      throw new Error("File contains suspicious AI instruction patterns.");
-    }
-  }
-  // Check for binary/shell commands
-  const shellCommandPatterns = [
-    /\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen)\s*[\(\[]/i,
-    /\b(rm\s+-rf|chmod|chown|sudo|wget|curl)\b/i,
-    /\$\(.*\)/,
-    /`[^`]+`/,
-  ];
-  for (const pattern of shellCommandPatterns) {
-    if (pattern.test(content)) {
-      throw new Error("File contains potential shell commands.");
-    }
+function validateContent(content) {
+  if (!content || content.trim().length === 0) {
+    throw new Error("Content is empty after sanitization.");
   }
 }
 
+function truncateChunk(content) {
+  if (content.length > MAX_CHUNK_LENGTH) {
+    return content.slice(0, MAX_CHUNK_LENGTH);
+  }
+  return content;
+}
+
+// Redact PII
 function redactPII(content) {
-  // Redact SSNs (e.g., 123-45-6789)
+  // SSN
   let redacted = content.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[REDACTED_SSN]");
-  // Redact email addresses
-  redacted = redacted.replace(
-    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
-    "[REDACTED_EMAIL]"
-  );
-  // Redact phone numbers (various formats)
-  redacted = redacted.replace(
-    /(\+?1?\s?)?(\(?\d{3}\)?[\s.\-]?)(\d{3}[\s.\-]?\d{4})/g,
-    "[REDACTED_PHONE]"
-  );
-  // Redact credit card numbers
-  redacted = redacted.replace(
-    /\b(?:\d[ -]?){13,16}\b/g,
-    "[REDACTED_CREDIT_CARD]"
-  );
-  // Redact dates of birth (common formats)
-  redacted = redacted.replace(
-    /\b(0?[1-9]|1[0-2])[\/\-](0?[1-9]|[12]\d|3[01])[\/\-](19|20)\d{2}\b/g,
-    "[REDACTED_DOB]"
-  );
-  // Redact medical record numbers (MRN patterns)
-  redacted = redacted.replace(
-    /\b(MRN|Medical Record(?: Number)?)[:\s#]*\d+\b/gi,
-    "[REDACTED_MRN]"
-  );
-  // Redact home addresses (basic pattern: number + street name + street type)
-  redacted = redacted.replace(
-    /\b\d+\s+[A-Za-z0-9\s,\.]+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b/gi,
-    "[REDACTED_ADDRESS]"
-  );
+  // Email addresses
+  redacted = redacted.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+  // Phone numbers (various formats)
+  redacted = redacted.replace(/(\+?\d[\d\s\-().]{7,}\d)/g, "[REDACTED_PHONE]");
+  // Credit card numbers (basic pattern)
+  redacted = redacted.replace(/\b(?:\d[ -]?){13,16}\b/g, "[REDACTED_CC]");
+  // Passport numbers (generic: letter(s) followed by digits)
+  redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, "[REDACTED_PASSPORT]");
+  // Home addresses (basic US pattern)
+  redacted = redacted.replace(/\d{1,5}\s[\w\s]{1,50}(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b/gi, "[REDACTED_ADDRESS]");
   return redacted;
 }
 
+// Singapore-specific PII detection
 function detectSingaporePII(content, fileName) {
-  // NRIC/FIN numbers (e.g., S1234567A, T0123456B, F1234567C, G1234567D)
-  if (/\b[STFG]\d{7}[A-Z]\b/.test(content)) {
-    throw new Error(
-      `File ${fileName} contains Singapore NRIC/FIN number. Skipping.`
-    );
+  // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+  const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i;
+  // SingPass identifier patterns
+  const singpassPattern = /singpass/i;
+
+  if (nricPattern.test(content)) {
+    throw new Error(`Singapore PII (NRIC/FIN) detected in file: ${fileName}. Skipping indexing.`);
   }
-  // Singapore passport numbers (e.g., E1234567A)
-  if (/\b[A-Z]\d{7}[A-Z]\b/.test(content)) {
-    throw new Error(
-      `File ${fileName} contains potential Singapore passport number. Skipping.`
-    );
-  }
-  // Singapore phone numbers (+65 XXXX XXXX or 8/9 XXXX XXXX)
-  if (/(\+65[\s-]?)?[89]\d{3}[\s-]?\d{4}\b/.test(content)) {
-    throw new Error(
-      `File ${fileName} contains Singapore phone number. Skipping.`
-    );
-  }
-  // Health record indicators
-  if (
-    /\b(patient|diagnosis|prescription|medical record|health record|clinical)\b/i.test(
-      content
-    )
-  ) {
-    throw new Error(
-      `File ${fileName} contains health record indicators. Skipping.`
-    );
-  }
-  // Full name patterns (common: two or more capitalized words)
-  if (/\b([A-Z][a-z]+\s){2,}[A-Z][a-z]+\b/.test(content)) {
-    throw new Error(
-      `File ${fileName} contains potential full name (PII). Skipping.`
-    );
+  if (singpassPattern.test(content)) {
+    throw new Error(`Singapore PII (SingPass identifier) detected in file: ${fileName}. Skipping indexing.`);
   }
 }
 
-const fileNames = fs.readdirSync("companions");
+// Malicious content / prompt injection detection
+function detectMaliciousContent(content, fileName) {
+  // Check for hidden/invisible characters (beyond what sanitize strips, e.g. zero-width)
+  const hiddenCharsPattern = /[\u200B-\u200D\uFEFF\u00AD]/;
+  if (hiddenCharsPattern.test(content)) {
+    throw new Error(`Hidden/invisible characters detected in file: ${fileName}. Rejecting.`);
+  }
+
+  // Check for base64-encoded payloads (long base64 strings)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/;
+  if (base64Pattern.test(content)) {
+    throw new Error(`Potential base64-encoded payload detected in file: ${fileName}. Rejecting.`);
+  }
+
+  // Check for leetspeak patterns (common substitutions)
+  const leetspeakPattern = /(\b\w*[0@][a-z]*\w*\b|\b\w*[1!][a-z]*\w*\b|\b\w*[3][a-z]*\w*\b){3,}/i;
+  if (leetspeakPattern.test(content)) {
+    throw new Error(`Leetspeak pattern detected in file: ${fileName}. Rejecting.`);
+  }
+
+  // Check for binary/shell command patterns
+  const shellCommandPattern = /(\/bin\/|\/etc\/|\/usr\/|bash|sh\s+-c|cmd\.exe|powershell|eval\s*\(|exec\s*\(|system\s*\(|`[^`]+`|\$\([^)]+\))/i;
+  if (shellCommandPattern.test(content)) {
+    throw new Error(`Binary/shell command pattern detected in file: ${fileName}. Rejecting.`);
+  }
+
+  // Check for suspicious prompt-injection keywords
+  const promptInjectionPattern = /\b(ignore previous instructions|disregard (all |prior |previous )?instructions|you are now|act as|pretend (to be|you are)|jailbreak|override (instructions|system|prompt)|forget (all |your |previous )?instructions|new instructions|system prompt|bypass|do not follow)\b/i;
+  if (promptInjectionPattern.test(content)) {
+    throw new Error(`Suspicious prompt-injection pattern detected in file: ${fileName}. Rejecting.`);
+  }
+}
+
+// Validate file path to prevent path traversal
+function isValidFilePath(baseDir, filePath) {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedFile = path.resolve(filePath);
+  return resolvedFile.startsWith(resolvedBase + path.sep) || resolvedFile === resolvedBase;
+}
+
+// Validate filename to safe characters only
+function isSafeFileName(fileName) {
+  return /^[a-zA-Z0-9_\-\.]+$/.test(fileName);
+}
+
+const baseDir = "companions";
+const fileNames = fs.readdirSync(baseDir);
 const splitter = new CharacterTextSplitter({
   separator: " ",
   chunkSize: 200,
@@ -161,43 +134,68 @@ const splitter = new CharacterTextSplitter({
 const langchainDocs = await Promise.all(
   fileNames.map(async (fileName) => {
     if (fileName.endsWith(".txt")) {
-      const filePath = path.join("companions", fileName);
-      const fileContent = fs.readFileSync(filePath, "utf8");
+      // Validate filename characters
+      if (!isSafeFileName(fileName)) {
+        console.warn(`Skipping file with unsafe filename: ${fileName}`);
+        return undefined;
+      }
+
+      const filePath = path.join(baseDir, fileName);
+
+      // Validate path to prevent path traversal
+      if (!isValidFilePath(baseDir, filePath)) {
+        console.warn(`Skipping file outside base directory: ${fileName}`);
+        return undefined;
+      }
+
+      // Check file size
+      const stats = fs.statSync(filePath);
+      if (stats.size > MAX_FILE_SIZE) {
+        console.warn(`Skipping file exceeding size limit: ${fileName}`);
+        return undefined;
+      }
+
+      let fileContent = fs.readFileSync(filePath, "utf8");
+
+      // Sanitize content
+      fileContent = sanitizeContent(fileContent);
+
+      try {
+        validateContent(fileContent);
+      } catch (e) {
+        console.warn(`Skipping file with invalid content (${fileName}): ${e.message}`);
+        return undefined;
+      }
+
+      // Detect malicious content / prompt injection
+      try {
+        detectMaliciousContent(fileContent, fileName);
+      } catch (e) {
+        console.warn(e.message);
+        return undefined;
+      }
+
+      // Detect Singapore-specific PII
+      try {
+        detectSingaporePII(fileContent, fileName);
+      } catch (e) {
+        console.warn(e.message);
+        return undefined;
+      }
+
+      // Redact PII
+      fileContent = redactPII(fileContent);
+
       // get the last section in the doc for background info
-      let lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
-
-      // Detect malicious content in file
-      try {
-        detectMaliciousContent(lastSection);
-      } catch (err) {
-        console.error(`Skipping file ${fileName}: ${err.message}`);
-        return undefined;
-      }
-
-      // Detect Singapore PII
-      try {
-        detectSingaporePII(lastSection, fileName);
-      } catch (err) {
-        console.error(`Skipping file ${fileName}: ${err.message}`);
-        return undefined;
-      }
-
-      // Redact PII from content
-      lastSection = redactPII(lastSection);
-
-      // Sanitize and validate content
-      try {
-        lastSection = sanitizeContent(lastSection);
-      } catch (err) {
-        console.error(`Skipping file ${fileName}: ${err.message}`);
-        return undefined;
-      }
-
+      const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
+        let pageContent = sanitizeContent(doc.pageContent);
+        pageContent = truncateChunk(pageContent);
+        pageContent = redactPII(pageContent);
         return new Document({
           metadata: { fileName },
-          pageContent: doc.pageContent,
+          pageContent,
         });
       });
     }
@@ -213,9 +211,7 @@ const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 
 await PineconeStore.fromDocuments(
   langchainDocs.flat().filter((doc) => doc !== undefined),
-  new HuggingFaceInferenceEmbeddings({
-    apiKey: process.env.HUGGINGFACEHUB_API_KEY,
-  }),
+  new HuggingFaceInferenceEmbeddings({ apiKey: process.env.HUGGINGFACEHUB_API_KEY }),
   {
     pineconeIndex,
   }
