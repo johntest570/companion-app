@@ -1,8 +1,7 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { OpenAI } from "langchain/llms/openai";
+import { ChatOpenAI } from "langchain/chat_models/openai";
 import { CallbackManager } from "langchain/callbacks";
-import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
@@ -10,40 +9,98 @@ import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
 
-const MAX_PROMPT_LENGTH = 4096;
-const DANGEROUS_PATTERNS = /\b(eval|exec|subprocess|Function\s*\(|new\s+Function|setTimeout\s*\(|setInterval\s*\(|execSync|spawnSync|child_process)\b/i;
+const ALLOWED_MODEL_IDS = ["meta/llama-2-13b-chat", "gpt-3.5-turbo"];
+const ALLOWED_COMPANIONS = [
+  "Alex.txt",
+  "Evelyn.txt",
+  "Lucky.txt",
+  "Rosie.txt",
+  "Sebastian.txt",
+];
 
-function sanitizeInput(input: string, maxLength: number = MAX_PROMPT_LENGTH): string {
-  if (typeof input !== "string") return "";
-  return input.trim().slice(0, maxLength).replace(/[<>]/g, "");
+function sanitizeInput(input: string, maxLength = 8000): string {
+  if (!input) return "";
+  // Strip null bytes and control characters (except newlines and tabs)
+  let sanitized = input.replace(/\0/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Strip dangerous code execution primitives
+  sanitized = sanitized.replace(/\b(eval|exec|subprocess|os\.system|child_process|spawn|execSync|spawnSync|execFile)\s*\(/gi, "[REDACTED](");
+  // Strip shell command patterns
+  sanitized = sanitized.replace(/(`[^`]*`|\$\([^)]*\))/g, "[REDACTED]");
+  // Strip invisible Unicode characters
+  sanitized = sanitized.replace(/[\u200B-\u200D\uFEFF\u00AD\u2060]/g, "");
+  // Truncate to max length
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength);
+  }
+  return sanitized;
 }
 
-function validateName(name: string | null): boolean {
-  if (!name) return false;
-  return /^[a-zA-Z0-9_-]+$/.test(name);
+function sanitizeName(name: string): string {
+  // Allow only alphanumeric characters, hyphens, and underscores (prevent path traversal)
+  return name.replace(/[^a-zA-Z0-9_-]/g, "");
 }
 
-function validateUserId(userId: string): boolean {
-  if (!userId || typeof userId !== "string") return false;
-  return /^[a-zA-Z0-9_\-\.@]+$/.test(userId.trim()) && userId.trim().length <= 128;
+function validateFileContent(content: string): void {
+  // Check for hidden/invisible control characters
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
+    throw new Error("Companion file contains invalid control characters.");
+  }
+  // Check for base64-encoded payloads (long base64 strings)
+  if (/[A-Za-z0-9+/]{100,}={0,2}/.test(content)) {
+    throw new Error("Companion file contains suspicious base64-encoded content.");
+  }
+  // Check for shell commands
+  if (/\b(eval|exec|subprocess|os\.system|child_process|spawn|execSync|spawnSync|execFile)\s*\(/.test(content)) {
+    throw new Error("Companion file contains suspicious shell command patterns.");
+  }
+  // Check for binary content
+  if (/[\x80-\xFF]/.test(content)) {
+    throw new Error("Companion file contains binary content.");
+  }
+  // Check for invisible Unicode characters
+  if (/[\u200B-\u200D\uFEFF\u00AD\u2060]/.test(content)) {
+    throw new Error("Companion file contains hidden Unicode characters.");
+  }
+  // Check for leetspeak patterns combined with suspicious keywords
+  if (/[3@!1|0]{4,}/.test(content)) {
+    throw new Error("Companion file contains suspicious leetspeak patterns.");
+  }
 }
 
-function validateUserName(userName: string): boolean {
-  if (!userName || typeof userName !== "string") return false;
-  return /^[a-zA-Z0-9_ \-\.]+$/.test(userName.trim()) && userName.trim().length <= 64;
-}
-
-function containsDangerousPatterns(output: string): boolean {
-  return DANGEROUS_PATTERNS.test(output);
+function sanitizeOutput(output: string): string {
+  const dangerousPatterns = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bsubprocess\b/gi,
+    /\bos\.system\s*\(/gi,
+    /\bchild_process\b/gi,
+    /\bspawn\s*\(/gi,
+    /\bexecSync\s*\(/gi,
+    /\bspawnSync\s*\(/gi,
+    /\bexecFile\s*\(/gi,
+    /(`[^`]*`|\$\([^)]*\))/g,
+  ];
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(output)) {
+      throw new Error("LLM output contains dangerous code execution primitives.");
+    }
+  }
+  let sanitized = output;
+  for (const pattern of dangerousPatterns) {
+    sanitized = sanitized.replace(pattern, "[REDACTED]");
+  }
+  return sanitized;
 }
 
 export async function POST(request: Request) {
-  const { prompt, isText, userId, userName } = await request.json();
-  let clerkUserId;
-  let user;
-  let clerkUserName;
+  const { prompt: rawPrompt, isText, userName } = await request.json();
 
-  const identifier = request.url + "-" + (userId || "anonymous");
+  // Always authenticate server-side via Clerk
+  const user = await currentUser();
+  const clerkUserId = user?.id;
+  const clerkUserName = isText ? (userName || user?.firstName) : user?.firstName;
+
+  const identifier = request.url + "-" + (clerkUserId || "anonymous");
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -58,51 +115,7 @@ export async function POST(request: Request) {
     );
   }
 
-  // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
-  const name = request.headers.get("name");
-
-  if (!validateName(name)) {
-    return new NextResponse(
-      JSON.stringify({ Message: "Invalid companion name." }),
-      {
-        status: 400,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-  }
-
-  const companion_file_name = name + ".txt";
-
-  if (isText) {
-    if (!validateUserId(userId)) {
-      return new NextResponse(
-        JSON.stringify({ Message: "Invalid userId format." }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-    if (!validateUserName(userName)) {
-      return new NextResponse(
-        JSON.stringify({ Message: "Invalid userName format." }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-    clerkUserId = userId;
-    clerkUserName = userName;
-  } else {
-    user = await currentUser();
-    clerkUserId = user?.id;
-    clerkUserName = user?.firstName;
-  }
-
-  if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+  if (!clerkUserId) {
     return new NextResponse(
       JSON.stringify({ Message: "User not authorized" }),
       {
@@ -114,17 +127,62 @@ export async function POST(request: Request) {
     );
   }
 
-  // Load character "PREAMBLE" from character file. These are the core personality
-  // characteristics that are used in every prompt. Additional background is
-  // only included if it matches a similarity comparioson with the current
-  // discussion. The PREAMBLE should include a seed conversation whose format will
-  // vary by the model using it.
+  // Sanitize and validate the name header (prevent path traversal)
+  const rawName = request.headers.get("name") || "";
+  const name = sanitizeName(rawName);
+  const companion_file_name = name + ".txt";
+
+  // Validate companion file name against allow list
+  if (!ALLOWED_COMPANIONS.includes(companion_file_name)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Companion not permitted." }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // Sanitize prompt input
+  const prompt = sanitizeInput(rawPrompt || "");
+
+  // Load character "PREAMBLE" from character file.
   const fs = require("fs").promises;
-  const data = await fs.readFile("companions/" + companion_file_name, "utf8");
+  let data: string;
+  try {
+    data = await fs.readFile("companions/" + companion_file_name, "utf8");
+  } catch (err) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Companion file not found." }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // Validate file content for malicious patterns
+  try {
+    validateFileContent(data);
+  } catch (err: any) {
+    return new NextResponse(
+      JSON.stringify({ Message: err.message || "Companion file failed validation." }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
-  const preamble = sanitizeInput(presplit[0], 8192);
+  const preamble = sanitizeInput(presplit[0]);
   const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
   const seedchat = seedsplit[0];
 
@@ -141,35 +199,53 @@ export async function POST(request: Request) {
   if (records.length === 0) {
     await memoryManager.seedChatHistory(seedchat, "\n\n", companionKey);
   }
-
-  const sanitizedPrompt = sanitizeInput(prompt, MAX_PROMPT_LENGTH);
-
   await memoryManager.writeToHistory(
-    "### Human: " + sanitizedPrompt + "\n",
+    "### Human: " + prompt + "\n",
     companionKey
   );
 
+  // Query Pinecone
   let recentChatHistory = await memoryManager.readLatestHistory(companionKey);
+  recentChatHistory = sanitizeInput(recentChatHistory);
 
-  // Pinecone vector search removed to reduce external system credentials to three
+  const similarDocs = await memoryManager.vectorSearch(
+    recentChatHistory,
+    companion_file_name
+  );
+
   let relevantHistory = "";
+  if (!!similarDocs && similarDocs.length !== 0) {
+    relevantHistory = sanitizeInput(
+      similarDocs.map((doc) => doc.pageContent).join("\n")
+    );
+  }
 
-  const sanitizedRelevantHistory = sanitizeInput(relevantHistory, 4096);
+  // Validate model ID against allow list
+  const selectedModelId = "gpt-3.5-turbo";
+  if (!ALLOWED_MODEL_IDS.includes(selectedModelId)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Model not permitted." }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
 
-  // Call OpenAI for inference
-  const model = new OpenAI({
-    modelName: "gpt-3.5-turbo",
+  // Call OpenAI for inference (approved model replacing disallowed vicuna-13b)
+  const model = new ChatOpenAI({
+    modelName: selectedModelId,
     openAIApiKey: process.env.OPENAI_API_KEY,
+    streaming: true,
     callbackManager: CallbackManager.fromHandlers(handlers),
   });
-
-  // Turn verbose on for debugging
-  model.verbose = true;
 
   const llmPrompt = `${preamble}  
        
        Below are relevant details about ${name}'s past:
-       ${sanitizedRelevantHistory}
+       ${relevantHistory}
 
        Below is a relevant conversation history
 
@@ -177,20 +253,20 @@ export async function POST(request: Request) {
        ### ${name}:
        `;
 
-  console.log("INFO: LLM input prompt:", llmPrompt);
+  // Log the prompt before sending to LLM
+  console.log("INFO: Sending prompt to LLM", JSON.stringify({ model: selectedModelId, prompt: llmPrompt }));
 
-  let resp = String(
-    await model
-      .call(llmPrompt)
-      .catch(console.error)
-  );
-
-  console.log("INFO: LLM output response:", resp);
-
-  if (containsDangerousPatterns(resp)) {
-    console.log("INFO: Dangerous pattern detected in LLM output. Rejecting response.");
+  let rawResp: string;
+  try {
+    rawResp = String(
+      await model.call([
+        { role: "user", content: llmPrompt } as any,
+      ])
+    );
+  } catch (err) {
+    console.error("ERROR: LLM call failed", err);
     return new NextResponse(
-      JSON.stringify({ Message: "Response rejected due to policy violation." }),
+      JSON.stringify({ Message: "LLM call failed." }),
       {
         status: 500,
         headers: {
@@ -200,13 +276,29 @@ export async function POST(request: Request) {
     );
   }
 
-  // Right now just using super shoddy string manip logic to get at
-  // the dialog.
+  // Log the response received from LLM
+  console.log("INFO: Received response from LLM", JSON.stringify({ model: selectedModelId, response: rawResp }));
 
-  const cleaned = resp.replaceAll(",", "");
+  // Sanitize and validate LLM output
+  let sanitizedResp: string;
+  try {
+    sanitizedResp = sanitizeOutput(rawResp);
+  } catch (err: any) {
+    console.error("ERROR: LLM output failed safety check", err.message);
+    return new NextResponse(
+      JSON.stringify({ Message: "LLM response failed safety validation." }),
+      {
+        status: 500,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  const cleaned = sanitizedResp.replaceAll(",", "");
   const chunks = cleaned.split("###");
   const response = chunks[0];
-  // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
   await memoryManager.writeToHistory("### " + response.trim(), companionKey);
   var Readable = require("stream").Readable;
