@@ -10,133 +10,86 @@ import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
 
+const POLICY_VERSION = "1.0.0";
+const ALLOWED_COMPANIONS = ["Alex", "Evelyn", "Lucky", "Rosie", "Sebastian"];
+const ALLOWED_MODELS = ["gpt-3.5-turbo"];
+const SELECTED_MODEL = "gpt-3.5-turbo";
+
+const DANGEROUS_PATTERNS = [
+  /\beval\s*\(/i,
+  /\bexec\s*\(/i,
+  /\bsubprocess\b/i,
+  /\bos\.system\s*\(/i,
+  /\bspawn\s*\(/i,
+  /\bshell\s*=\s*True/i,
+  /\bpopen\s*\(/i,
+  /\b__import__\s*\(/i,
+  /\bimportlib\b/i,
+  /\bFunction\s*\(/i,
+  /\bnew\s+Function\b/i,
+  /\bsetTimeout\s*\(\s*["'`]/i,
+  /\bsetInterval\s*\(\s*["'`]/i,
+];
+
+const INJECTION_PATTERNS = [
+  /[;\|&`\$\(\)\{\}><]/,
+  /base64/i,
+  /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/,
+];
+
+const MAX_INPUT_LENGTH = 4000;
+
 function sanitizeInput(input: string): string {
-  // Strip null bytes
-  let sanitized = input.replace(/\0/g, "");
-  // Trim whitespace
-  sanitized = sanitized.trim();
-  // Remove prompt-injection patterns
-  sanitized = sanitized
-    .split("\n")
-    .filter((line) => {
-      const trimmed = line.trimStart();
-      return (
-        !trimmed.startsWith("SYSTEM:") &&
-        !trimmed.startsWith("INST:") &&
-        !trimmed.startsWith("###") &&
-        !trimmed.startsWith("[INST]")
-      );
-    })
-    .join("\n");
+  if (!input) return "";
+  // Remove null bytes and control characters
+  let sanitized = input.replace(/\x00/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  // Truncate excessively long strings
+  if (sanitized.length > MAX_INPUT_LENGTH) {
+    sanitized = sanitized.substring(0, MAX_INPUT_LENGTH);
+  }
   return sanitized;
 }
 
-function sanitizeFileContent(content: string): string {
-  const MAX_LENGTH = 50000;
-
-  // Reject binary/non-UTF-8 content (check for replacement character)
-  if (content.includes("\uFFFD")) {
-    throw new Error("Invalid file content: binary or non-UTF-8 data detected");
+function containsDangerousContent(text: string): boolean {
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(text)) {
+      return true;
+    }
   }
-
-  // Strip invisible/zero-width Unicode characters
-  content = content.replace(
-    /[\u200B\u200C\u200D\u200E\u200F\uFEFF\u00AD\u2060]/g,
-    ""
-  );
-
-  // Strip or reject base64-encoded blobs (long base64 strings)
-  content = content.replace(/[A-Za-z0-9+/]{100,}={0,2}/g, "");
-
-  // Detect and reject shell command patterns
-  const shellPatterns = /(\$\(|\`|;\s*rm\s|;\s*curl\s|;\s*wget\s|&&\s*rm\s)/i;
-  if (shellPatterns.test(content)) {
-    throw new Error("Invalid file content: shell command patterns detected");
-  }
-
-  // Detect and reject common prompt-injection trigger phrases
-  const injectionPatterns =
-    /ignore previous instructions|system:|you are now|forget your instructions|disregard your/i;
-  if (injectionPatterns.test(content)) {
-    throw new Error(
-      "Invalid file content: prompt injection patterns detected"
-    );
-  }
-
-  // Enforce length cap
-  if (content.length > MAX_LENGTH) {
-    content = content.substring(0, MAX_LENGTH);
-  }
-
-  // Also apply sanitizeInput patterns
-  content = sanitizeInput(content);
-
-  return content;
+  return false;
 }
 
-function sanitizeLLMOutput(output: string): string {
-  const dangerousPatterns =
-    /\beval\s*\(|\bexec\s*\(|\bsubprocess\b|\bos\.system\s*\(|\bspawn\s*\(|\bFunction\s*\(|\bnew\s+Function\b/i;
-  if (dangerousPatterns.test(output)) {
-    console.warn(
-      "WARNING: LLM output contained dangerous code execution primitives, sanitizing."
-    );
-    return "[Response blocked due to unsafe content]";
+function containsInjectionAttempt(text: string): boolean {
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(text)) {
+      return true;
+    }
   }
-  return output;
+  return false;
+}
+
+function sanitizeCompanionName(name: string): string | null {
+  if (!name) return null;
+  // Allow only alphanumeric characters, hyphens, and underscores
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return null;
+  }
+  return name;
+}
+
+function logAudit(entry: Record<string, unknown>): void {
+  console.log(JSON.stringify({ audit: true, timestamp: new Date().toISOString(), policyVersion: POLICY_VERSION, ...entry }));
 }
 
 export async function POST(request: Request) {
-  const { prompt, isText, userId, userName } = await request.json();
-  let clerkUserId;
-  let user;
-  let clerkUserName;
+  const { prompt: rawPrompt, isText } = await request.json();
 
-  // Validate and sanitize userId
-  if (isText) {
-    if (
-      !userId ||
-      typeof userId !== "string" ||
-      userId.trim().length === 0 ||
-      !/^[a-zA-Z0-9_\-]+$/.test(userId.trim())
-    ) {
-      return new NextResponse(
-        JSON.stringify({ Message: "Invalid userId" }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-    if (
-      !userName ||
-      typeof userName !== "string" ||
-      userName.trim().length === 0 ||
-      !/^[a-zA-Z0-9_\- ]+$/.test(userName.trim())
-    ) {
-      return new NextResponse(
-        JSON.stringify({ Message: "Invalid userName" }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-  }
+  // Always use server-side Clerk authentication regardless of isText
+  const user = await currentUser();
+  const clerkUserId = user?.id;
+  const clerkUserName = user?.firstName;
 
-  // Sanitize prompt
-  if (!prompt || typeof prompt !== "string") {
-    return new NextResponse(
-      JSON.stringify({ Message: "Invalid prompt" }),
-      {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      }
-    );
-  }
-  const sanitizedPrompt = sanitizeInput(prompt.substring(0, 4096));
-
-  const identifier = request.url + "-" + (userId || "anonymous");
+  const identifier = request.url + "-" + (clerkUserId || "anonymous");
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -151,32 +104,8 @@ export async function POST(request: Request) {
     );
   }
 
-  // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
-  const rawName = request.headers.get("name");
-
-  // Validate name to only allow alphanumeric characters and hyphens/underscores
-  if (!rawName || !/^[a-zA-Z0-9_\-]+$/.test(rawName)) {
-    return new NextResponse(
-      JSON.stringify({ Message: "Invalid companion name" }),
-      {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      }
-    );
-  }
-  const name = rawName;
-  const companion_file_name = name + ".txt";
-
-  if (isText) {
-    clerkUserId = userId.trim();
-    clerkUserName = userName.trim();
-  } else {
-    user = await currentUser();
-    clerkUserId = user?.id;
-    clerkUserName = user?.firstName;
-  }
-
   if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+    logAudit({ event: "auth_failure", userId: clerkUserId });
     return new NextResponse(
       JSON.stringify({ Message: "User not authorized" }),
       {
@@ -188,34 +117,69 @@ export async function POST(request: Request) {
     );
   }
 
-  // Load character "PREAMBLE" from character file. These are the core personality
-  // characteristics that are used in every prompt. Additional background is
-  // only included if it matches a similarity comparioson with the current
-  // discussion. The PREAMBLE should include a seed conversation whose format will
-  // vary by the model using it.
-  const fs = require("fs").promises;
-  const data = await fs.readFile("companions/" + companion_file_name, "utf8");
+  // Sanitize and validate the companion name header to prevent path traversal
+  const rawName = request.headers.get("name");
+  const name = rawName ? sanitizeCompanionName(rawName) : null;
 
-  // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
-  const presplit = data.split("###ENDPREAMBLE###");
-  let preamble = presplit[0];
-  const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
-  let seedchat = seedsplit[0];
-
-  // Sanitize file content to prevent malicious prompt injection
-  try {
-    preamble = sanitizeFileContent(preamble);
-    seedchat = sanitizeFileContent(seedchat);
-  } catch (e: any) {
-    console.error("File content sanitization failed:", e.message);
+  if (!name) {
+    logAudit({ event: "invalid_companion_name", rawName, userId: clerkUserId });
     return new NextResponse(
-      JSON.stringify({ Message: "Invalid companion file content" }),
+      JSON.stringify({ Message: "Invalid companion name." }),
       {
         status: 400,
         headers: { "Content-Type": "application/json" },
       }
     );
   }
+
+  // Validate companion name against allow list
+  if (!ALLOWED_COMPANIONS.includes(name)) {
+    logAudit({ event: "companion_not_allowed", companion: name, userId: clerkUserId, outcome: "denied" });
+    return new NextResponse(
+      JSON.stringify({ Message: "Companion not permitted by policy." }),
+      {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // Validate model against allow list
+  if (!ALLOWED_MODELS.includes(SELECTED_MODEL)) {
+    logAudit({ event: "model_not_allowed", model: SELECTED_MODEL, userId: clerkUserId, outcome: "denied" });
+    return new NextResponse(
+      JSON.stringify({ Message: "Model not permitted by policy." }),
+      {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  const companion_file_name = name + ".txt";
+
+  // Sanitize prompt
+  const prompt = sanitizeInput(rawPrompt || "");
+
+  if (containsInjectionAttempt(prompt)) {
+    logAudit({ event: "injection_attempt_in_prompt", userId: clerkUserId });
+    return new NextResponse(
+      JSON.stringify({ Message: "Input contains disallowed content." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  const fs = require("fs").promises;
+  const data = await fs.readFile("companions/" + companion_file_name, "utf8");
+
+  // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
+  const presplit = data.split("###ENDPREAMBLE###");
+  const preamble = sanitizeInput(presplit[0]);
+  const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
+  const seedchat = seedsplit[0];
 
   const companionKey = {
     companionName: name!,
@@ -228,24 +192,27 @@ export async function POST(request: Request) {
   if (records.length === 0) {
     await memoryManager.seedChatHistory(seedchat, "\n\n", companionKey);
   }
-  await memoryManager.writeToHistory(
-    "User: " + sanitizedPrompt + "\n",
-    companionKey
-  );
+  await memoryManager.writeToHistory("User: " + prompt + "\n", companionKey);
 
-  // Query chat history only (no Pinecone vector search to limit external credentials)
+  // Query Pinecone
   let recentChatHistory = await memoryManager.readLatestHistory(companionKey);
-
-  // Sanitize recentChatHistory before embedding in prompt
   const sanitizedRecentChatHistory = sanitizeInput(recentChatHistory);
 
-  // No vector search - use empty relevantHistory to reduce external system credentials
-  const relevantHistory = "";
+  const similarDocs = await memoryManager.vectorSearch(
+    recentChatHistory,
+    companion_file_name
+  );
+
+  let relevantHistory = "";
+  if (!!similarDocs && similarDocs.length !== 0) {
+    relevantHistory = sanitizeInput(similarDocs.map((doc) => doc.pageContent).join("\n"));
+  }
 
   const { stream, handlers } = LangChainStream();
-  // Call OpenAI GPT-3.5-turbo for inference (approved model)
+
+  // Call OpenAI for inference (approved model)
   const model = new OpenAI({
-    modelName: "gpt-3.5-turbo-instruct",
+    modelName: SELECTED_MODEL,
     maxTokens: 2048,
     openAIApiKey: process.env.OPENAI_API_KEY,
     callbackManager: CallbackManager.fromHandlers(handlers),
@@ -254,7 +221,7 @@ export async function POST(request: Request) {
   // Turn verbose on for debugging
   model.verbose = true;
 
-  const llmPrompt = `
+  const fullPrompt = `
        ONLY generate NO more than three sentences as ${name}. DO NOT generate more than three sentences. 
        Make sure the output you generate starts with '${name}:' and ends with a period.
 
@@ -266,26 +233,82 @@ export async function POST(request: Request) {
 
        ${sanitizedRecentChatHistory}\n${name}:`;
 
-  console.log("INFO: Sending prompt to LLM:", llmPrompt);
+  // Log the prompt before sending to the model
+  console.log(JSON.stringify({
+    event: "llm_request",
+    timestamp: new Date().toISOString(),
+    userId: clerkUserId,
+    model: SELECTED_MODEL,
+    companion: name,
+    prompt: fullPrompt,
+  }));
 
-  let resp = String(
-    await model
-      .call(llmPrompt)
-      .catch(console.error)
-  );
+  logAudit({
+    event: "tool_invocation",
+    actor: clerkUserId,
+    model: SELECTED_MODEL,
+    companion: name,
+    outcome: "attempt",
+  });
 
-  console.log("INFO: Received response from LLM:", resp);
+  let resp: string;
+  try {
+    resp = String(await model.call(fullPrompt));
+  } catch (err) {
+    logAudit({
+      event: "tool_invocation",
+      actor: clerkUserId,
+      model: SELECTED_MODEL,
+      companion: name,
+      outcome: "failure",
+      error: String(err),
+    });
+    console.error("LLM call failed:", err);
+    return new NextResponse(
+      JSON.stringify({ Message: "Model inference failed." }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // Log the response received from the model
+  console.log(JSON.stringify({
+    event: "llm_response",
+    timestamp: new Date().toISOString(),
+    userId: clerkUserId,
+    model: SELECTED_MODEL,
+    companion: name,
+    response: resp,
+  }));
+
+  logAudit({
+    event: "tool_invocation",
+    actor: clerkUserId,
+    model: SELECTED_MODEL,
+    companion: name,
+    outcome: "success",
+  });
+
+  // Validate and sanitize LLM output for dangerous content
+  if (containsDangerousContent(resp)) {
+    console.error("LLM output contains dangerous content, blocking response.");
+    logAudit({ event: "dangerous_output_blocked", userId: clerkUserId, model: SELECTED_MODEL, companion: name });
+    return new NextResponse(
+      JSON.stringify({ Message: "Response blocked due to policy violation." }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
 
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
-
   const cleaned = resp.replaceAll(",", "");
   const chunks = cleaned.split("\n");
-  let response = chunks[0];
-  // const response = chunks.length > 1 ? chunks[0] : chunks[0];
-
-  // Sanitize LLM output for dangerous code execution primitives
-  response = sanitizeLLMOutput(response);
+  const response = chunks[0];
 
   await memoryManager.writeToHistory("" + response.trim(), companionKey);
   var Readable = require("stream").Readable;
