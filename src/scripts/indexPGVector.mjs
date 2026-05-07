@@ -1,10 +1,6 @@
 // Call embeding API and insert to supabase
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
 
-// External systems accessed by this script:
-// 1. Supabase (SUPABASE_URL, SUPABASE_PRIVATE_KEY)
-// 2. HuggingFace Inference API (HUGGINGFACEHUB_API_KEY)
-
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
 import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
@@ -17,116 +13,168 @@ import path from "path";
 
 dotenv.config({ path: `.env.local` });
 
-const MAX_CONTENT_LENGTH = 100000;
-
-// Sanitize and validate file content: strip null bytes, control characters, excessively long content
-function sanitizeFileContent(content) {
-  if (typeof content !== "string") return "";
-  // Strip null bytes and control characters (except newline, carriage return, tab)
-  let sanitized = content.replace(/\x00/g, "").replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-  // Truncate excessively long content
-  if (sanitized.length > MAX_CONTENT_LENGTH) {
-    sanitized = sanitized.slice(0, MAX_CONTENT_LENGTH);
+// Validate required environment variables
+const requiredEnvVars = ["SUPABASE_URL", "SUPABASE_PRIVATE_KEY", "HUGGINGFACEHUB_API_KEY"];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    throw new Error(`Missing required environment variable: ${envVar}`);
   }
-  return sanitized;
 }
 
-// Sanitize against malicious prompt injection, hidden prompts, invisible characters,
-// base64-encoded prompts, leetspeak prompts, suspicious instruction patterns, binary/shell commands
-function sanitizePromptInjection(content) {
-  if (typeof content !== "string") return "";
-  // Remove invisible/zero-width characters
-  let sanitized = content.replace(/[\u200B-\u200D\uFEFF\u00AD\u2060]/g, "");
-  // Remove base64-encoded blocks that look like injected prompts (long base64 strings)
-  sanitized = sanitized.replace(/(?:[A-Za-z0-9+/]{40,}={0,2})/g, "[REDACTED_BASE64]");
-  // Remove suspicious instruction patterns
-  const suspiciousPatterns = [
-    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
-    /system\s*prompt/gi,
-    /you\s+are\s+now/gi,
-    /act\s+as\s+(a\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted)/gi,
-    /disregard\s+(all\s+)?(previous|prior|above)/gi,
-    /forget\s+(all\s+)?(previous|prior|above)/gi,
-    /new\s+instructions?:/gi,
-    /override\s+(all\s+)?instructions?/gi,
-  ];
-  for (const pattern of suspiciousPatterns) {
-    sanitized = sanitized.replace(pattern, "[REDACTED]");
-  }
-  // Remove shell/binary command patterns
-  sanitized = sanitized.replace(/(\$\(|\`)[^\)`]*(\)|\`)/g, "[REDACTED_CMD]");
-  sanitized = sanitized.replace(/\b(rm\s+-rf|chmod|chown|wget|curl\s+.*\|.*sh|bash\s+-c|sh\s+-c|exec\s+|\/bin\/sh|\/bin\/bash)\b/gi, "[REDACTED_CMD]");
-  return sanitized;
-}
+const MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024; // 1 MB
+const MAX_CONTENT_LENGTH = 500000; // max characters for content
+const COMPANIONS_DIR = path.resolve("companions");
 
-// Redact PII: SSN, email, phone, home address patterns, credit card numbers
-function redactPII(content) {
-  if (typeof content !== "string") return "";
-  let redacted = content;
-  // SSN (US): XXX-XX-XXXX
-  redacted = redacted.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[REDACTED_SSN]");
+// PII redaction patterns (general)
+function redactPII(text) {
   // Email addresses
-  redacted = redacted.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[REDACTED_EMAIL]");
-  // Phone numbers (various formats)
-  redacted = redacted.replace(/(\+?\d[\s\-.]?)?(\(?\d{3}\)?[\s\-.]?)(\d{3}[\s\-.]?\d{4})/g, "[REDACTED_PHONE]");
-  // Credit card numbers (16 digits, with or without spaces/dashes)
-  redacted = redacted.replace(/\b(?:\d[ \-]?){13,16}\b/g, "[REDACTED_CC]");
-  // Home address patterns (basic: number + street name + street type)
-  redacted = redacted.replace(/\b\d{1,5}\s+\w+(\s+\w+){0,3}\s+(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b/gi, "[REDACTED_ADDRESS]");
-  return redacted;
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+  // Phone numbers (general)
+  text = text.replace(/(\+?\d[\d\s\-().]{7,}\d)/g, "[REDACTED_PHONE]");
+  // SSNs (US)
+  text = text.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[REDACTED_SSN]");
+  // Credit card numbers
+  text = text.replace(/\b(?:\d[ -]?){13,16}\b/g, "[REDACTED_CC]");
+  // IP addresses
+  text = text.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "[REDACTED_IP]");
+  return text;
 }
 
-// Singapore-specific PII detection: NRIC/FIN, SingPass, full names, personal emails
-function detectSingaporePII(content, fileName) {
-  if (typeof content !== "string") return;
-  // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
-  const nricPattern = /\b[STFG]\d{7}[A-Z]\b/gi;
-  if (nricPattern.test(content)) {
-    throw new Error(`Singapore PII detected (NRIC/FIN) in file: ${fileName}. Skipping.`);
+// Singapore PII detection and redaction
+function redactSingaporePII(text) {
+  // NRIC/FIN numbers (e.g., S1234567A, T1234567B, F1234567C, G1234567D)
+  if (/\b[STFG]\d{7}[A-Z]\b/i.test(text)) {
+    console.warn("Warning: Singapore NRIC/FIN detected and redacted.");
+    text = text.replace(/\b[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_NRIC]");
   }
-  // SingPass identifier patterns
-  const singpassPattern = /singpass/gi;
-  if (singpassPattern.test(content)) {
-    throw new Error(`Singapore PII detected (SingPass reference) in file: ${fileName}. Skipping.`);
+  // SingPass identifiers (heuristic: "singpass" followed by identifier)
+  if (/singpass\s*[:\-]?\s*\S+/i.test(text)) {
+    console.warn("Warning: SingPass identifier detected and redacted.");
+    text = text.replace(/singpass\s*[:\-]?\s*\S+/gi, "[REDACTED_SINGPASS]");
   }
-  // Personal email addresses (already handled by redactPII, but check for remaining after redaction)
-  const emailPattern = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g;
-  if (emailPattern.test(content)) {
-    throw new Error(`Singapore PII detected (personal email) in file: ${fileName}. Skipping.`);
+  // Singapore phone numbers (+65 XXXX XXXX or 8/9 XXXX XXXX)
+  if (/(\+65[\s\-]?)?[89]\d{3}[\s\-]?\d{4}\b/.test(text)) {
+    console.warn("Warning: Singapore phone number detected and redacted.");
+    text = text.replace(/(\+65[\s\-]?)?[89]\d{3}[\s\-]?\d{4}\b/g, "[REDACTED_SG_PHONE]");
   }
+  // Singapore postal codes (6-digit starting with valid range)
+  if (/\b[0-9]{6}\b/.test(text)) {
+    console.warn("Warning: Potential Singapore postal code detected and redacted.");
+    text = text.replace(/\b[0-9]{6}\b/g, "[REDACTED_POSTAL]");
+  }
+  return text;
 }
 
-// Validate and sanitize LLM output / document pageContent for dynamic code execution primitives
-function sanitizeLLMOutput(pageContent) {
-  if (typeof pageContent !== "string") return "";
-  const dangerousPatterns = [
-    /\beval\s*\(/gi,
-    /\bexec\s*\(/gi,
-    /new\s+Function\s*\(/gi,
-    /setTimeout\s*\(\s*["'`]/gi,
-    /setInterval\s*\(\s*["'`]/gi,
-    /\bimportScripts\s*\(/gi,
-    /document\.write\s*\(/gi,
-    /\.innerHTML\s*=/gi,
-    /\bprocess\.binding\s*\(/gi,
-    /require\s*\(\s*["'`]child_process["'`]\s*\)/gi,
+// Sanitize and validate input to AI model
+function sanitizeInput(text) {
+  // Strip null bytes and non-printable control characters (except newline, tab, carriage return)
+  text = text.replace(/\0/g, "");
+  text = text.replace(/[^\x09\x0A\x0D\x20-\x7E\x80-\xFF]/g, "");
+
+  // Enforce maximum content length
+  if (text.length > MAX_CONTENT_LENGTH) {
+    text = text.substring(0, MAX_CONTENT_LENGTH);
+  }
+
+  // Detect and reject potential prompt injection patterns
+  const promptInjectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /you\s+are\s+now\s+/i,
+    /act\s+as\s+(if\s+you\s+are|a)\s+/i,
+    /system\s*:\s*/i,
+    /\[INST\]/i,
+    /<\|im_start\|>/i,
   ];
-  let sanitized = pageContent;
-  for (const pattern of dangerousPatterns) {
-    if (pattern.test(sanitized)) {
-      sanitized = sanitized.replace(pattern, "[REDACTED_CODE]");
+  for (const pattern of promptInjectionPatterns) {
+    if (pattern.test(text)) {
+      throw new Error("Potential prompt injection detected in content. Rejecting document.");
     }
   }
-  return sanitized;
+
+  return text;
 }
 
-// Validate final document pageContent
-function isValidDocument(doc) {
-  if (!doc || typeof doc.pageContent !== "string") return false;
-  const content = doc.pageContent.trim();
-  if (content.length === 0) return false;
-  if (content.length > MAX_CONTENT_LENGTH) return false;
-  return true;
+// Sanitize file content for malicious patterns (prompt injection, hidden chars, base64, shell commands)
+function sanitizeFileContent(text) {
+  // Strip hidden/invisible characters (zero-width, soft hyphen, etc.)
+  text = text.replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g, "");
+
+  // Detect base64-encoded content (long base64 strings)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g;
+  if (base64Pattern.test(text)) {
+    console.warn("Warning: Potential base64-encoded content detected and stripped.");
+    text = text.replace(/(?:[A-Za-z0-9+/]{40,}={0,2})/g, "[REDACTED_BASE64]");
+  }
+
+  // Detect leetspeak patterns (simple heuristic)
+  const leetspeakPattern = /(\b\w*[013457@$!]\w*\b){5,}/;
+  if (leetspeakPattern.test(text)) {
+    console.warn("Warning: Potential leetspeak content detected.");
+  }
+
+  // Detect shell/binary commands
+  const shellPatterns = [
+    /\b(bash|sh|zsh|cmd|powershell|exec|system|popen|subprocess|os\.system)\s*[\(\[]/i,
+    /\b(rm\s+-rf|chmod|chown|wget|curl\s+.*\|)\b/i,
+    /\$\(.*\)/,
+    /`[^`]+`/,
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(text)) {
+      console.warn("Warning: Potential shell/binary command detected and stripped.");
+      text = text.replace(pattern, "[REDACTED_CMD]");
+    }
+  }
+
+  // Detect suspicious instruction patterns
+  const suspiciousPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /you\s+are\s+now\s+/i,
+    /act\s+as\s+(if\s+you\s+are|a)\s+/i,
+  ];
+  for (const pattern of suspiciousPatterns) {
+    if (pattern.test(text)) {
+      console.warn("Warning: Suspicious instruction pattern detected and stripped.");
+      text = text.replace(pattern, "[REDACTED_INJECTION]");
+    }
+  }
+
+  return text;
+}
+
+// Validate and sanitize LLM output (check for dynamic code execution primitives)
+function sanitizeLLMOutput(text) {
+  const dangerousPatterns = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bsubprocess\b/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*["'`]/i,
+    /\bsetInterval\s*\(\s*["'`]/i,
+    /\bimportlib\b/i,
+    /\b__import__\s*\(/i,
+    /\bos\.system\s*\(/i,
+    /\bchild_process\b/i,
+  ];
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(text)) {
+      throw new Error(`Dangerous code execution primitive detected in LLM output: ${pattern}`);
+    }
+  }
+  return text;
+}
+
+// Path traversal protection
+function safeResolvePath(dir, fileName) {
+  const resolvedDir = path.resolve(dir);
+  const resolvedFile = path.resolve(dir, fileName);
+  if (!resolvedFile.startsWith(resolvedDir + path.sep) && resolvedFile !== resolvedDir) {
+    throw new Error(`Path traversal detected for file: ${fileName}`);
+  }
+  return resolvedFile;
 }
 
 const fileNames = fs.readdirSync("companions");
@@ -139,30 +187,55 @@ const splitter = new CharacterTextSplitter({
 const langchainDocs = await Promise.all(
   fileNames.map(async (fileName) => {
     if (fileName.endsWith(".txt")) {
-      const filePath = path.join("companions", fileName);
-      let fileContent = fs.readFileSync(filePath, "utf8");
+      const filePath = safeResolvePath(COMPANIONS_DIR, fileName);
 
-      // Sanitize and validate file content before processing
-      fileContent = sanitizeFileContent(fileContent);
-      fileContent = sanitizePromptInjection(fileContent);
-      fileContent = redactPII(fileContent);
-
-      // Detect Singapore-specific PII; skip file if found
-      try {
-        detectSingaporePII(fileContent, fileName);
-      } catch (err) {
-        console.error(err.message);
-        return [];
+      // File size check
+      const stats = fs.statSync(filePath);
+      if (stats.size > MAX_FILE_SIZE_BYTES) {
+        console.warn(`Skipping file ${fileName}: exceeds maximum allowed size of ${MAX_FILE_SIZE_BYTES} bytes.`);
+        return undefined;
       }
 
+      let fileContent = fs.readFileSync(filePath, "utf8");
+
+      // Truncate to safe maximum length
+      if (fileContent.length > MAX_CONTENT_LENGTH) {
+        fileContent = fileContent.substring(0, MAX_CONTENT_LENGTH);
+      }
+
+      // Sanitize file content for malicious patterns
+      fileContent = sanitizeFileContent(fileContent);
+
+      // Redact general PII
+      fileContent = redactPII(fileContent);
+
+      // Redact Singapore-specific PII
+      fileContent = redactSingaporePII(fileContent);
+
       const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
-      const splitDocs = await splitter.createDocuments([lastSection]);
+
+      // Sanitize and validate input before passing to AI model
+      let sanitizedSection;
+      try {
+        sanitizedSection = sanitizeInput(lastSection);
+      } catch (err) {
+        console.warn(`Skipping file ${fileName}: ${err.message}`);
+        return undefined;
+      }
+
+      const splitDocs = await splitter.createDocuments([sanitizedSection]);
       return splitDocs.map((doc) => {
-        // Sanitize LLM output / document content for dynamic code execution primitives
-        const sanitizedContent = sanitizeLLMOutput(doc.pageContent);
+        // Validate and sanitize LLM output
+        let safeContent;
+        try {
+          safeContent = sanitizeLLMOutput(doc.pageContent);
+        } catch (err) {
+          console.warn(`Skipping document chunk from ${fileName}: ${err.message}`);
+          return undefined;
+        }
         return new Document({
           metadata: { fileName },
-          pageContent: sanitizedContent,
+          pageContent: safeContent,
         });
       });
     }
@@ -181,12 +254,14 @@ const client = createClient(
   { auth }
 );
 
-// Filter and validate all documents before passing to the vector store
-const validDocs = langchainDocs.flat().filter((doc) => doc !== undefined && isValidDocument(doc));
+const flatDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
 
 await SupabaseVectorStore.fromDocuments(
-  validDocs,
-  new HuggingFaceInferenceEmbeddings({ apiKey: process.env.HUGGINGFACEHUB_API_KEY }),
+  flatDocs,
+  new HuggingFaceInferenceEmbeddings({
+    apiKey: process.env.HUGGINGFACEHUB_API_KEY,
+    model: "sentence-transformers/all-MiniLM-L6-v2",
+  }),
   {
     client,
     tableName: "documents",
