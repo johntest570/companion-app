@@ -62,7 +62,9 @@ class MemoryManager {
         .similaritySearch(recentChatHistory, 3, { fileName: companionFileName })
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
+          return [];
         });
+      if (!similarDocs || similarDocs.length === 0) return [];
       return similarDocs;
     } else {
       console.log("INFO: using Supabase for vector search.");
@@ -79,7 +81,9 @@ class MemoryManager {
         .similaritySearch(recentChatHistory, 3)
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
+          return [];
         });
+      if (!similarDocs || similarDocs.length === 0) return [];
       return similarDocs;
     }
   }
