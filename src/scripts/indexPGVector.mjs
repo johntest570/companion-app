@@ -25,6 +25,9 @@ const langchainDocs = await Promise.all(
     if (fileName.endsWith(".txt")) {
       const filePath = path.join("companions", fileName);
       const fileContent = fs.readFileSync(filePath, "utf8");
+      if (!fileContent.includes("###ENDSEEDCHAT###")) {
+        throw new Error(`Invalid file format: ${fileName}. Missing required section delimiter.`);
+      }
       const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
