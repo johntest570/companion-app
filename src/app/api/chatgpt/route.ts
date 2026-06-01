@@ -18,6 +18,20 @@ export async function POST(req: Request) {
   let clerkUserName;
   const { prompt, isText, userId, userName } = await req.json();
 
+  // Validate prompt input against shell command patterns
+  const shellCommandPattern = /[;&|`$(){}<>]/g;
+  if (shellCommandPattern.test(prompt)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid prompt content detected" }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
   const identifier = req.url + "-" + (userId || "anonymous");
   const { success } = await rateLimit(identifier);
   if (!success) {
@@ -140,13 +154,20 @@ export async function POST(req: Request) {
     })
     .catch(console.error);
 
-  console.log("result", result);
+  console.log("LLM interaction logged:", { input: { relevantHistory, recentChatHistory }, output: result });
   const chatHistoryRecord = await memoryManager.writeToHistory(
     result!.text + "\n",
     companionKey
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
   if (isText) {
+    const forbiddenPatterns = /eval\(|new Function|setTimeout|setInterval|exec\(|script/i;
+    if (forbiddenPatterns.test(result!.text)) {
+      return new NextResponse(
+        JSON.stringify({ error: "Content validation failed - potential code execution detected" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
     return NextResponse.json(result!.text);
   }
   return new StreamingTextResponse(stream);
