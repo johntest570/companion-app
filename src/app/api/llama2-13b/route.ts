@@ -11,7 +11,19 @@ import { rateLimit } from "@/app/utils/rateLimit";
 dotenv.config({ path: `.env.local` });
 
 export async function POST(request: Request) {
+  const sanitizeInput = (input: string) => input?.replace(/[${}`\\]/g, '\\$&') || '';
   const { prompt, isText, userId, userName } = await request.json();
+  if (!prompt) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Missing required 'prompt' parameter" }),
+      {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
   let clerkUserId;
   let user;
   let clerkUserName;
@@ -32,7 +44,7 @@ export async function POST(request: Request) {
   }
 
   // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
-  const name = request.headers.get("name");
+  const name = sanitizeInput(request.headers.get("name"));
   const companion_file_name = name + ".txt";
 
   if (isText) {
@@ -65,9 +77,20 @@ export async function POST(request: Request) {
   const data = await fs.readFile("companions/" + companion_file_name, "utf8");
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
-  const presplit = data.split("###ENDPREAMBLE###");
+  if (presplit.length < 2) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion file format - missing preamble" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
   const preamble = presplit[0];
   const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
+  if (seedsplit.length < 2) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion file format - missing seed chat" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
   const seedchat = seedsplit[0];
 
   const companionKey = {
@@ -108,7 +131,12 @@ export async function POST(request: Request) {
       max_length: 2048,
     },
     apiKey: process.env.REPLICATE_API_TOKEN,
-    callbackManager: CallbackManager.fromHandlers(handlers),
+    callbackManager: CallbackManager.fromHandlers({
+  ...handlers,
+  handleLLMEnd: (output) => {
+    console.log(JSON.stringify(output));
+  },
+}),
   });
 
   // Turn verbose on for debugging
@@ -118,16 +146,16 @@ export async function POST(request: Request) {
     await model
       .call(
         `
-       ONLY generate NO more than three sentences as ${name}. DO NOT generate more than three sentences. 
-       Make sure the output you generate starts with '${name}:' and ends with a period.
+       ONLY generate NO more than three sentences as ${sanitizeInput(name)}. DO NOT generate more than three sentences. 
+       Make sure the output you generate starts with '${sanitizeInput(name)}:' and ends with a period.
 
        ${preamble}
 
-       Below are relevant details about ${name}'s past and the conversation you are in.
+       Below are relevant details about ${sanitizeInput(name)}'s past and the conversation you are in.
        ${relevantHistory}
 
 
-       ${recentChatHistory}\n${name}:`
+       ${sanitizeInput(recentChatHistory)}\n${sanitizeInput(name)}:`
       )
       .catch(console.error)
   );
@@ -135,9 +163,14 @@ export async function POST(request: Request) {
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = resp.replaceAll(",", "");
+  const cleaned = resp.replace(/<[^>]*>/g, '').replaceAll(",", "");
   const chunks = cleaned.split("\n");
-  const response = chunks[0];
+  let response = chunks[0];
+  const forbiddenPatterns = [/eval\(/, /new Function\(/, /setTimeout\(/, /setInterval\(/, /exec\(/];
+  const isUnsafe = forbiddenPatterns.some(pattern => pattern.test(response));
+  if (isUnsafe) {
+    response = "Apologies, I can't assist with that.";
+  }
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
   await memoryManager.writeToHistory("" + response.trim(), companionKey);
