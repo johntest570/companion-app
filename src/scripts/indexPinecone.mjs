@@ -22,6 +22,9 @@ const langchainDocs = await Promise.all(
     if (fileName.endsWith(".txt")) {
       const filePath = path.join("companions", fileName);
       const fileContent = fs.readFileSync(filePath, "utf8");
+      if (!fileContent.includes('###ENDSEEDCHAT###')) {
+        throw new Error(`Invalid file format in ${fileName} - missing required section marker`);
+      }
       // get the last section in the doc for background info
       const lastSection = fileContent.split("###ENDSEEDCHAT###").slice(-1)[0];
       const splitDocs = await splitter.createDocuments([lastSection]);
@@ -44,7 +47,18 @@ const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 
 await PineconeStore.fromDocuments(
   langchainDocs.flat().filter((doc) => doc !== undefined),
-  new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+  new OpenAIEmbeddings({
+  openAIApiKey: process.env.OPENAI_API_KEY,
+  callbacks: [{
+    handleLLMEnd: (output) => {
+      console.log('Logged OpenAIEmbeddings interaction:', {
+        timestamp: new Date().toISOString(),
+        model: output.model,
+        tokenUsage: output.usage
+      });
+    }
+  }]
+}),
   {
     pineconeIndex,
   }

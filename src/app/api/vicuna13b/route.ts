@@ -12,6 +12,10 @@ dotenv.config({ path: `.env.local` });
 
 export async function POST(request: Request) {
   const { prompt, isText, userId, userName } = await request.json();
+
+const sanitizeInput = (input: string) => {
+  return input.replace(/[`###]/g, '');
+};
   let clerkUserId;
   let user;
   let clerkUserName;
@@ -63,6 +67,13 @@ export async function POST(request: Request) {
   // vary by the model using it.
   const fs = require("fs").promises;
   const data = await fs.readFile("companions/" + companion_file_name, "utf8");
+
+if (!data.includes("###ENDPREAMBLE###") || !data.includes("###ENDSEEDCHAT###")) {
+  return new NextResponse(
+    JSON.stringify({ Message: "Invalid companion file format" }),
+    { status: 400, headers: { "Content-Type": "application/json" } }
+  );
+}
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
@@ -122,15 +133,15 @@ export async function POST(request: Request) {
   let resp = String(
     await model
       .call(
-        `${preamble}  
+        `${sanitizeInput(preamble)}  
        
-       Below are relevant details about ${name}'s past:
-       ${relevantHistory}
+       Below are relevant details about ${sanitizeInput(name)}'s past:
+       ${sanitizeInput(relevantHistory)}
 
        Below is a relevant conversation history
 
-       ${recentChatHistory}
-       ### ${name}:
+       ${sanitizeInput(recentChatHistory)}
+       ### ${sanitizeInput(name)}:
        `
       )
       .catch(console.error)
@@ -139,7 +150,7 @@ export async function POST(request: Request) {
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = resp.replaceAll(",", "");
+  const cleaned = resp.replaceAll(/[<>{}\\]/g, "");
   const chunks = cleaned.split("###");
   const response = chunks[0];
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];

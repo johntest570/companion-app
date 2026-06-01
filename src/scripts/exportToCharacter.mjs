@@ -74,7 +74,9 @@ const questions = [
 const results = await Promise.all(
   questions.map(async (question) => {
     try {
-      return await chain.call({ question });
+      const result = await chain.call({ question });
+    await fs.appendFile(`${COMPANION_NAME}_llm_interactions.log`, `QUESTION: ${question}\nRESPONSE: ${result.text}\n\n`);
+    return result;
     } catch (error) {
       console.error(error);
     }
