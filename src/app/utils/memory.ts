@@ -54,7 +54,11 @@ class MemoryManager {
       );
 
       const vectorStore = await PineconeStore.fromExistingIndex(
-        new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+        const embeddings = const embeddings = new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY });
+    console.log("LLM interaction: Initialized OpenAI Embeddings for vector operations");
+    embeddings;
+    console.log("LLM interaction: Initialized OpenAI Embeddings for vector operations");
+    embeddings,
         { pineconeIndex }
       );
 
@@ -63,7 +67,7 @@ class MemoryManager {
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
-      return similarDocs;
+      return similarDocs?.map((doc) => ({ ...doc, metadata: { ...doc.metadata, content_label: "AI-Generated", provenance: "vector_search", watermark: "synthetic-content-v1" } })) ?? similarDocs;
     } else {
       console.log("INFO: using Supabase for vector search.");
       const supabaseClient = <SupabaseClient>this.vectorDBClient;
@@ -80,7 +84,7 @@ class MemoryManager {
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
-      return similarDocs;
+      return similarDocs?.map((doc) => ({ ...doc, metadata: { ...doc.metadata, content_label: "AI-Generated", provenance: "vector_search", watermark: "synthetic-content-v1" } })) ?? similarDocs;
     }
   }
 
