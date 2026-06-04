@@ -27,7 +27,7 @@ const langchainDocs = await Promise.all(
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
         return new Document({
-          metadata: { fileName },
+          metadata: { fileName, provenance: 'AI-generated', contentLabel: 'synthetic' },
           pageContent: doc.pageContent,
         });
       });
@@ -42,10 +42,17 @@ await client.init({
 });
 const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 
-await PineconeStore.fromDocuments(
-  langchainDocs.flat().filter((doc) => doc !== undefined),
-  new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
-  {
-    pineconeIndex,
-  }
-);
+console.log("Initiating Pinecone MCP server interaction...");
+try {
+  await PineconeStore.fromDocuments(
+    langchainDocs.flat().filter((doc) => doc !== undefined),
+    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+    {
+      pineconeIndex,
+    }
+  );
+  console.log("Pinecone MCP server interaction completed successfully");
+} catch (error) {
+  console.error("Pinecone MCP server interaction failed:", error);
+  throw error;
+}

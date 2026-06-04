@@ -139,7 +139,7 @@ export async function POST(request: Request) {
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = resp.replaceAll(",", "");
+  const cleaned = resp.replaceAll(/[<>,]/g, (match) => match === ',' ? '' : match === '<' ? '&lt;' : '&gt;');
   const chunks = cleaned.split("###");
   const response = chunks[0];
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
@@ -154,5 +154,14 @@ export async function POST(request: Request) {
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
   }
 
-  return new StreamingTextResponse(s);
+  if (response === undefined || response.length <= 1) {
+  return new Response("Error: Invalid response generated", { status: 500 });
+}
+return new StreamingTextResponse(s, {
+  headers: {
+    'X-Content-Provenance': 'AI-generated',
+    'X-Content-Label': 'AI',
+    'X-Watermark': 'AI-Generated-Content'
+  }
+});
 }

@@ -1,5 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  llmLogging: {
+    enabled: true,
+    endpoint: '/api/log-interaction'
+  },
   experimental: {
     serverActions: true,
   },

@@ -37,7 +37,7 @@ export async function POST(req: Request) {
   const name = req.headers.get("name");
   const companionFileName = name + ".txt";
 
-  console.log("prompt: ", prompt);
+  console.log("User prompt received");
   if (isText) {
     clerkUserId = userId;
     clerkUserName = userName;
@@ -103,11 +103,12 @@ export async function POST(req: Request) {
   const { stream, handlers } = LangChainStream();
 
   const model = new OpenAI({
-    streaming: true,
-    modelName: "gpt-3.5-turbo-16k",
-    openAIApiKey: process.env.OPENAI_API_KEY,
-    callbackManager: CallbackManager.fromHandlers(handlers),
-  });
+  streaming: true,
+  modelName: "gpt-3.5-turbo-16k",
+  openAIApiKey: process.env.OPENAI_API_KEY,
+  callbackManager: CallbackManager.fromHandlers(handlers),
+  maxTokens: 1000,
+});
   model.verbose = true;
 
   const replyWithTwilioLimit = isText
@@ -140,14 +141,28 @@ export async function POST(req: Request) {
     })
     .catch(console.error);
 
+  console.log('MCP Interaction:', JSON.stringify({
+    userId: clerkUserId,
+    companion: name,
+    input: { relevantHistory, recentChatHistory },
+    output: result,
+    timestamp: new Date().toISOString()
+  }));
+
   console.log("result", result);
   const chatHistoryRecord = await memoryManager.writeToHistory(
-    result!.text + "\n",
+    result!.text.replace(/<[^>]*>/g, '').replace(/<[^>]*>/g, '') + "\n",
     companionKey
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
   if (isText) {
     return NextResponse.json(result!.text);
   }
-  return new StreamingTextResponse(stream);
+  return new StreamingTextResponse(stream, {
+  headers: {
+    'X-Content-Provenance': 'AI-generated',
+    'X-Content-Label': 'synthetic',
+    'X-Watermark': 'generated-by-ai-v1'
+  }
+});
 }

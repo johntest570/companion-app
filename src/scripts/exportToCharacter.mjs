@@ -38,6 +38,11 @@ const upstashChatHistory = await history.zrange(
     byScore: true,
   }
 );
+console.log('Logged MCP interaction with Upstash Redis:', {
+  key: `${COMPANION_NAME}-${MODEL_NAME}-${USER_ID}`,
+  timestamp: Date.now(),
+  entryCount: upstashChatHistory.length
+});
 const recentChat = upstashChatHistory.slice(-30);
 const model = new OpenAI({
   modelName: "gpt-3.5-turbo-16k",
@@ -74,7 +79,13 @@ const questions = [
 const results = await Promise.all(
   questions.map(async (question) => {
     try {
-      return await chain.call({ question });
+      const result = await chain.call({ question });
+      await fs.appendFile('llm_interactions.log', JSON.stringify({
+        timestamp: new Date().toISOString(),
+        input: question,
+        output: result.text
+      }) + '\n');
+      return result;
     } catch (error) {
       console.error(error);
     }
@@ -88,4 +99,12 @@ for (let i = 0; i < questions.length; i++) {
 output += `Definition (Advanced)\n${recentChat.join("\n")}`;
 
 await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, upstashChatHistory);
-await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, output);
+const metadata = `=== AI-Generated Content ===
+Generated at: ${new Date().toISOString()}
+Model: ${MODEL_NAME}
+Companion: ${COMPANION_NAME}
+User ID: ${USER_ID}
+=======================
+
+`;
+await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, metadata + output);
