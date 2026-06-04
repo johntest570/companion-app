@@ -12,6 +12,11 @@ import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
 
+function sanitizeOutput(text: string): string {
+  return text.replace(/<[^>]*>/g, '');
+}
+
+
 export async function POST(req: Request) {
   let clerkUserId;
   let user;
@@ -37,7 +42,7 @@ export async function POST(req: Request) {
   const name = req.headers.get("name");
   const companionFileName = name + ".txt";
 
-  console.log("prompt: ", prompt);
+  console.log("User prompt received"); // Generic log without PII
   if (isText) {
     clerkUserId = userId;
     clerkUserName = userName;
@@ -115,7 +120,7 @@ export async function POST(req: Request) {
     : "";
 
   const chainPrompt = PromptTemplate.fromTemplate(`
-    You are ${name} and are currently talking to ${clerkUserName}.
+    You are ${name} and are currently in a conversation.
 
     ${preamble}
 
@@ -133,21 +138,39 @@ export async function POST(req: Request) {
     prompt: chainPrompt,
   });
 
-  const result = await chain
-    .call({
+  const input = {
       relevantHistory,
       recentChatHistory: recentChatHistory,
-    })
-    .catch(console.error);
+    };
+    console.log("MCP interaction input:", input);
+    const inputParams = {
+  relevantHistory,
+  recentChatHistory: recentChatHistory,
+};
+console.log('LLM interaction input:', inputParams);
+const result = await chain.call(inputParams).catch(console.error);
+console.log('LLM interaction result:', result?.text);
 
-  console.log("result", result);
+  console.log("MCP interaction output:", result);
   const chatHistoryRecord = await memoryManager.writeToHistory(
-    result!.text + "\n",
+    sanitizeOutput(result!.text) + "\n",
     companionKey
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
   if (isText) {
-    return NextResponse.json(result!.text);
+    return NextResponse.json(result!.text, {
+  headers: {
+    'X-Content-Source': 'AI-Generated',
+    'X-AI-Content-Label': 'synthetic',
+    'X-Content-Watermark': 'generated-by-ai-v1.0'
   }
-  return new StreamingTextResponse(stream);
+});
+  }
+  return new StreamingTextResponse(stream, {
+  headers: {
+    'X-Content-Source': 'AI-Generated',
+    'X-AI-Content-Label': 'synthetic',
+    'X-Content-Watermark': 'generated-by-ai-v1.0'
+  }
+});
 }
