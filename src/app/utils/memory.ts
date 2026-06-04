@@ -58,9 +58,11 @@ class MemoryManager {
         { pineconeIndex }
       );
 
-      const similarDocs = await vectorStore
-        .similaritySearch(recentChatHistory, 3, { fileName: companionFileName })
-        .catch((err) => {
+      console.log('MCP interaction: Pinecone similarity search', { companionFileName, recentChatHistory });
+console.log('MCP interaction: Supabase similarity search', { recentChatHistory });
+const similarDocs = await vectorStore
+  .similaritySearch(recentChatHistory, 3)
+  .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
       return similarDocs;

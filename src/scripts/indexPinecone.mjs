@@ -27,7 +27,7 @@ const langchainDocs = await Promise.all(
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
         return new Document({
-          metadata: { fileName },
+          metadata: { fileName, source: 'AI-generated', contentLabel: 'synthetic', watermark: true },
           pageContent: doc.pageContent,
         });
       });
@@ -40,12 +40,23 @@ await client.init({
   apiKey: process.env.PINECONE_API_KEY,
   environment: process.env.PINECONE_ENVIRONMENT,
 });
-const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
+const indexName = process.env.PINECONE_INDEX?.trim();
+if (!indexName) {
+  throw new Error('PINECONE_INDEX environment variable is missing or invalid');
+}
+const pineconeIndex = client.Index(indexName);
 
-await PineconeStore.fromDocuments(
-  langchainDocs.flat().filter((doc) => doc !== undefined),
-  new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
-  {
-    pineconeIndex,
-  }
-);
+console.log("Starting Pinecone document indexing...");
+try {
+  await PineconeStore.fromDocuments(
+    langchainDocs.flat().filter((doc) => doc !== undefined),
+    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+    {
+      pineconeIndex,
+    }
+  );
+  console.log("Successfully indexed documents into Pinecone");
+} catch (error) {
+  console.error("Failed to index documents into Pinecone:", error);
+  throw error;
+}

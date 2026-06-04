@@ -135,7 +135,7 @@ export async function POST(request: Request) {
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = resp.replaceAll(",", "");
+  const cleaned = resp.replace(/<[^>]*>?/g, '').replace(/[^\w\s.,!?']/g, '');
   const chunks = cleaned.split("\n");
   const response = chunks[0];
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
@@ -150,5 +150,11 @@ export async function POST(request: Request) {
     memoryManager.writeToHistory("" + response.trim(), companionKey);
   }
 
-  return new StreamingTextResponse(s);
+  return new StreamingTextResponse(s, {
+  headers: {
+    'X-Content-Label': 'AI-Generated',
+    'X-Content-Provenance': 'model=a16z-infra/llama13b-v2-chat, provider=replicate',
+    'X-Watermark': '1'
+  }
+});
 }
