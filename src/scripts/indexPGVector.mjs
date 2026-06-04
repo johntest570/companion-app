@@ -29,7 +29,7 @@ const langchainDocs = await Promise.all(
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
         return new Document({
-          metadata: { fileName },
+          metadata: { fileName, provenance: 'ai-generated' },
           pageContent: doc.pageContent,
         });
       });
@@ -49,6 +49,7 @@ const client = createClient(
   { auth }
 );
 
+console.log('Starting Supabase document insertion', { documentCount: langchainDocs.flat().filter((doc) => doc !== undefined).length })
 await SupabaseVectorStore.fromDocuments(
   langchainDocs.flat().filter((doc) => doc !== undefined),
   new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
@@ -56,4 +57,5 @@ await SupabaseVectorStore.fromDocuments(
     client,
     tableName: "documents",
   }
-);
+)
+console.log('Completed Supabase document insertion')
