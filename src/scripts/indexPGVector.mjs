@@ -29,7 +29,7 @@ const langchainDocs = await Promise.all(
       const splitDocs = await splitter.createDocuments([lastSection]);
       return splitDocs.map((doc) => {
         return new Document({
-          metadata: { fileName },
+          metadata: { fileName, source: "ai_generated", watermark: true, generated_by: "openai" },
           pageContent: doc.pageContent,
         });
       });
@@ -49,11 +49,20 @@ const client = createClient(
   { auth }
 );
 
+console.log("Starting MCP server interaction - uploading documents to Supabase");
 await SupabaseVectorStore.fromDocuments(
   langchainDocs.flat().filter((doc) => doc !== undefined),
-  new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+  new OpenAIEmbeddings({
+  openAIApiKey: process.env.OPENAI_API_KEY,
+  callbacks: [{
+    handleLLMStart(llm, prompts) {
+      console.log('LLM interaction started:', llm._llmType());
+    }
+  }]
+}),
   {
     client,
     tableName: "documents",
   }
 );
+console.log("Successfully completed MCP server interaction with Supabase");
