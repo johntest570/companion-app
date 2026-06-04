@@ -74,7 +74,10 @@ const questions = [
 const results = await Promise.all(
   questions.map(async (question) => {
     try {
-      return await chain.call({ question });
+      const result = await chain.call({ question });
+      console.log('LLM Input:', question);
+      console.log('LLM Output:', result.text);
+      return result;
     } catch (error) {
       console.error(error);
     }
