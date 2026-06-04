@@ -119,7 +119,18 @@ export async function POST(request: Request) {
   // Turn verbose on for debugging
   model.verbose = true;
 
-  let resp = String(
+  const input = `${preamble}  
+       
+       Below are relevant details about ${name}'s past:
+       ${relevantHistory}
+
+       Below is a relevant conversation history
+
+       ${recentChatHistory}
+       ### ${name}:
+       `;
+console.log('MCP Replicate/vicuna-13b request:', input);
+let resp = String(
     await model
       .call(
         `${preamble}  
@@ -136,10 +147,22 @@ export async function POST(request: Request) {
       .catch(console.error)
   );
 
+  // Log LLM interaction
+  console.log('LLM interaction', {
+    prompt,
+    response: resp,
+    userId: clerkUserId,
+    userName: clerkUserName,
+    model: 'vicuna13b',
+    timestamp: new Date().toISOString()
+  });
+console.log('MCP Replicate/vicuna-13b response:', resp);
+
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
 
-  const cleaned = resp.replaceAll(",", "");
+  const cleaned = resp.replaceAll(",", "")
+  .replaceAll(/(eval|Function|setTimeout|setInterval|new Function)\s*\(/gi, '');
   const chunks = cleaned.split("###");
   const response = chunks[0];
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
@@ -154,5 +177,5 @@ export async function POST(request: Request) {
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
   }
 
-  return new StreamingTextResponse(s);
+  return new StreamingTextResponse(s, { headers: { "X-AI-Generated": "true", "X-Content-Provenance": "replicate/vicuna-13b", "Content-Label": "AI-Generated" } });
 }
